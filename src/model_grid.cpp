@@ -412,34 +412,6 @@ void ModelGrid::load_3d_model() {
             );
         }
 
-        // --- vp (optional, fallback: empirical vs2vp) ---
-        if (f.exists("vp")) {
-            interpolate_or_copy("vp", vp3d);
-            logger.Info(
-                same_grid ? "Loaded 'vp' from HDF5 file." :
-                            "Loaded and interpolated 'vp' onto current model grid.",
-                MODULE_GRID
-            );
-        } else {
-            logger.Info("'vp' not found in HDF5 file, computing from empirical vs2vp.", MODULE_GRID);
-            for (hsize_t i = 0; i < expect_n; ++i)
-                vp3d[i] = vs2vp(vs3d[i]);
-        }
-
-        // --- rho (optional, fallback: empirical vp2rho) ---
-        if (f.exists("rho")) {
-            interpolate_or_copy("rho", rho3d);
-            logger.Info(
-                same_grid ? "Loaded 'rho' from HDF5 file." :
-                            "Loaded and interpolated 'rho' onto current model grid.",
-                MODULE_GRID
-            );
-        } else {
-            logger.Info("'rho' not found in HDF5 file, computing from empirical vp2rho.", MODULE_GRID);
-            for (hsize_t i = 0; i < expect_n; ++i)
-                rho3d[i] = vp2rho(vp3d[i]);
-        }
-
         // --- gc / gs (optional, only if model_para_type is MODEL_AZI_ANI) ---
         if (IP.inversion().model_para_type == MODEL_AZI_ANI) {
             if (f.exists("gc")) {
@@ -488,6 +460,45 @@ void ModelGrid::load_3d_model() {
                     ), MODULE_GRID);
                     mpi.abort(EXIT_FAILURE);
                 }
+            }
+        }
+
+        // Initialize Vp and density once, after both shear components are ready.
+        // Radial inversion derives these fields from mean Vs; other modes retain
+        // the optional input fields and their empirical fallbacks.
+        if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+            logger.Info("Computing shared Vp and density from mean Vs for the radial model.", MODULE_GRID);
+            for (hsize_t i = 0; i < expect_n; ++i) {
+                vp3d[i] = vs2vp(vsvvsh2vs(vs3d[i], vsh3d[i]));
+                rho3d[i] = vp2rho(vp3d[i]);
+            }
+        } else {
+            // --- vp (optional, fallback: empirical vs2vp) ---
+            if (f.exists("vp")) {
+                interpolate_or_copy("vp", vp3d);
+                logger.Info(
+                    same_grid ? "Loaded 'vp' from HDF5 file." :
+                                "Loaded and interpolated 'vp' onto current model grid.",
+                    MODULE_GRID
+                );
+            } else {
+                logger.Info("'vp' not found in HDF5 file, computing from empirical vs2vp.", MODULE_GRID);
+                for (hsize_t i = 0; i < expect_n; ++i)
+                    vp3d[i] = vs2vp(vs3d[i]);
+            }
+
+            // --- rho (optional, fallback: empirical vp2rho) ---
+            if (f.exists("rho")) {
+                interpolate_or_copy("rho", rho3d);
+                logger.Info(
+                    same_grid ? "Loaded 'rho' from HDF5 file." :
+                                "Loaded and interpolated 'rho' onto current model grid.",
+                    MODULE_GRID
+                );
+            } else {
+                logger.Info("'rho' not found in HDF5 file, computing from empirical vp2rho.", MODULE_GRID);
+                for (hsize_t i = 0; i < expect_n; ++i)
+                    rho3d[i] = vp2rho(vp3d[i]);
             }
         }
     } catch (const std::exception &e) {
@@ -738,10 +749,10 @@ void ModelGrid::add_radial_aniso_perturbation(
                     // vsh = vsv * sqrt(zeta)
                     auto [vsv_new, vsh_new] = recover_anisotropy(Vs_new, zeta_new);
 
-                    // Update vs3d to store Vs (for consistency with load_3d_model)
+                    // vs3d stores Vsv; Vp and density use the mean Vs.
                     vs3d[idx] = vsv_new;
                     vsh3d[idx] = vsh_new;
-                    vp3d[idx] = vs2vp(vsv_new);
+                    vp3d[idx] = vs2vp(Vs_new);
                     rho3d[idx] = vp2rho(vp3d[idx]);
                 }
             }
@@ -816,7 +827,7 @@ void ModelGrid::write(const std::string &subname) {
             f.write_volume("vsv", vs3d, ngrid_i, ngrid_j, ngrid_k);
             f.write_volume("vsh", vsh3d, ngrid_i, ngrid_j, ngrid_k);
 
-            // Compute and write Vs = sqrt((2*vsv + vsh)/3) and zeta = vsh^2/vsv^2
+            // Compute and write Vs = sqrt((2*vsv^2 + vsh^2)/3) and zeta = vsh^2/vsv^2
             std::vector<real_t> Vs(nelem);
             std::vector<real_t> zeta(nelem);
             for (int i = 0; i < nelem; ++i) {

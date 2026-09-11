@@ -212,6 +212,10 @@ void preproc::combine_kernels(SurfGrid& sg) {
     // vs kernel — always allocated (index 0)
     sg.ker_loc[0] = Tensor3r(dcp.loc_nx(), dcp.loc_ny(), ngrid_k);
     sg.ker_loc[0].setZero();
+    if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+        sg.ker_loc[5] = Tensor3r(dcp.loc_nx(), dcp.loc_ny(), ngrid_k);
+        sg.ker_loc[5].setZero();
+    }
     if (IP.inversion().use_alpha_beta_rho && sg.wave_type() == WaveType::RL) {
         // vp (1) and rho (2) — only when parametrised independently
         sg.ker_loc[1] = Tensor3r(dcp.loc_nx(), dcp.loc_ny(), ngrid_k);
@@ -251,7 +255,31 @@ void preproc::combine_kernels(SurfGrid& sg) {
         }
 
         // Isotropic parameter kernels — gated by use_alpha_beta_rho only
-        if (IP.inversion().use_alpha_beta_rho && sg.wave_type() == WaveType::RL) {
+        if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+            for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
+                for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
+                    const int gx = dcp.loc_I_start() + ix;
+                    const int gy = dcp.loc_J_start() + iy;
+                    for (int k = 0; k < ngrid_k; ++k) {
+                        const real_t vsv = mg.vs3d_loc(ix, iy, k);
+                        const real_t vsh = mg.vsh3d_loc(ix, iy, k);
+                        const auto [ka, kb] = radial_material_kernels(
+                            vsv, vsh, sg.sen_vs_loc(ix, iy, k, iper),
+                            sg.sen_vp_loc(ix, iy, k, iper),
+                            sg.sen_rho_loc(ix, iy, k, iper),
+                            sg.wave_type() == WaveType::LV);
+                        sg.ker_loc[0](ix, iy, k) -= adj_tt(gx, gy) * ka;
+                        sg.ker_loc[5](ix, iy, k) -= adj_tt(gx, gy) * kb;
+                        if (IP.postproc().is_kden) {
+                            // Preserve the wave-specific shear-speed coverage scale,
+                            // including the required empirical-material chain rule.
+                            sg.ker_den_loc(ix, iy, k) -= adj_den(gx, gy) *
+                                (sg.wave_type() == WaveType::LV ? kb : ka);
+                        }
+                    }
+                }
+            }
+        } else if (IP.inversion().use_alpha_beta_rho && sg.wave_type() == WaveType::RL) {
             for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
                 for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
                     const int iglob_x = dcp.loc_I_start() + ix;
@@ -358,4 +386,3 @@ void preproc::combine_kernels(SurfGrid& sg) {
     mpi.barrier();
 }
     
-

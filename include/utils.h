@@ -680,7 +680,7 @@ inline std::vector<std::string> fmt_col(const real_t* data, int n, int prec = 6)
 // Converts between (vsv, vsh) and (Vs, zeta) parameterizations.
 //
 // Definitions:
-//   Vs   = sqrt((2*vsv + vsh) / 3)  — RMS S-wave velocity
+//   Vs   = sqrt((2*vsv^2 + vsh^2) / 3)  — RMS S-wave velocity
 //   zeta = vsh^2 / vsv^2             — anisotropy ratio
 //
 // Supports scalar, vector (Eigen::VectorX), and tensor (Eigen::Tensor<3>) inputs.
@@ -689,6 +689,21 @@ inline std::vector<std::string> fmt_col(const real_t* data, int n, int prec = 6)
 // Scalar version: compute Vs from vsv and vsh
 inline real_t vsvvsh2vs(real_t vsv, real_t vsh) {
     return std::sqrt((2 * vsv* vsv + vsh * vsh) / 3);
+}
+
+// Absolute partial derivatives at independent (Vsv, Vsh), including the
+// shared empirical Vp(Vs) and rho(Vp(Vs)). The dispersion solver's beta is
+// Vsv for Rayleigh and Vsh for Love. Convert to log coordinates with
+// K_lnVsv = Vsv*K_vsv + Vsh*K_vsh, K_lngamma = Vsh*K_vsh.
+inline std::pair<real_t, real_t> radial_material_kernels(
+    real_t vsv, real_t vsh, real_t k_beta, real_t k_vp,
+    real_t k_rho, bool love
+) {
+    const real_t vs = vsvvsh2vs(vsv, vsh);
+    const real_t shared = dalpha_dbeta(vs) *
+        (k_vp + k_rho * drho_dalpha(vs2vp(vs)));
+    return {(love ? _0_CR : k_beta) + shared * 2 * vsv / (3 * vs),
+            (love ? k_beta : _0_CR) + shared * vsh / (3 * vs)};
 }
 
 // Scalar version: compute zeta from vsv and vsh
