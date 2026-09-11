@@ -790,7 +790,7 @@ static void energy_func(double om, double wvno, RayleighWork& s)
             double facav = rho * av * av * DUZDUZ / wvno2;
             s.dcda[m]  = facah + facav;
             double facr = -0.5 * c * c * (URUR + UZUZ);
-            s.dcdr[m]  = 0.5 * (facav + facah) + facr * rho;
+            s.dcdr[m]  = 0.5 * (av * facav + ah * facah) + facr * rho;
             s.dcdb[m]  = 0.0;
             s.dcdgc[m] = 0.0;
             s.dcdgs[m] = 0.0;
@@ -819,7 +819,7 @@ static void energy_func(double om, double wvno, RayleighWork& s)
             s.dcda[m]  = facah + facav;
             s.dcdb[m]  = facbv + facbh;
             double facr = -0.5 * c * c * (URUR + UZUZ);
-            s.dcdr[m]  = 0.5 * (facav + facah + facbv) + facr * rho;
+            s.dcdr[m]  = 0.5 * (av * facav + ah * facah + bv * facbv) + facr * rho;
             s.dcdgc[m] = rho*bv*bv*(UZUZ + 2.0*UZDUR/wvno + DURDUR/wvno2) + rho*bv*bv*URUR;
             s.dcdgs[m] = s.dcdgc[m];
         }
@@ -833,12 +833,9 @@ static void energy_func(double om, double wvno, RayleighWork& s)
 
     double inv_ug_s0 = 1.0 / (s.ugr * s.sumi0);
     for (int m = 0; m < mmax; m++) {
-        // facah/facav/facbv contain rho * velocity^2: dividing only by
-        // U*I0 gives logarithmic velocity derivatives. The public kernels
-        // are absolute derivatives dc/dVp, dc/dVs and dc/drho.
-        s.dcda[m]  *= inv_ug_s0 / s.za[m];
-        s.dcdb[m]  *= (s.iwat[m] == 1) ? 0.0 : inv_ug_s0 / s.zb[m];
-        s.dcdr[m]  *= inv_ug_s0 / s.zrho[m];
+        s.dcda[m]  *= inv_ug_s0;
+        s.dcdb[m]  *= inv_ug_s0;
+        s.dcdr[m]  *= inv_ug_s0;
         s.dcdgc[m] *= inv_ug_s0;
         s.dcdgs[m] *= inv_ug_s0;
     }

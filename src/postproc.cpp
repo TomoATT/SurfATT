@@ -518,7 +518,7 @@ void postproc::kernel_precondition(SurfGrid& sg) {
         );
 
     // Precondition the kernels by multiplying with the reference model parameters at each surface grid point
-    int nker = NPARAMS;
+    int nker = NPARAMS - 1;
     for (int iparam = 0; iparam < nker; ++iparam) {
         if (sg.is_active_ker(iparam)) {
             sg.ker_loc[iparam] = sg.ker_loc[iparam] * hess_inv;

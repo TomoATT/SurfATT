@@ -82,12 +82,10 @@ SurfGrid::SurfGrid(WaveType wt, SurfType vt){
 
 void SurfGrid::setup_active_kernels() {
     auto& IP = InputParams::IP();
-    active_kernels_ = std::vector<bool>(NPARAMS, false);
-    active_kernels_[0] = true;  // vs (Vsv for radial models)
-    if (IP.inversion().model_para_type == MODEL_RADIAL_ANI)
-        active_kernels_[5] = true;  // independent Vsh partial, for both waves
+    active_kernels_ = std::vector<bool>(NPARAMS-1, false);
+    active_kernels_[0] = true;  // vp
     if (IP.inversion().use_alpha_beta_rho && wt_ == WaveType::RL) {
-        active_kernels_[1] = true;  // vp
+        active_kernels_[1] = true;  // vs
         active_kernels_[2] = true;  // rho
     }
     if (IP.inversion().model_para_type == MODEL_AZI_ANI && wt_ == WaveType::RL) {
@@ -300,10 +298,7 @@ void SurfGrid::compute_dispersion_kernel() {
                     vp1d(k) = mg.vp3d_loc(ix, iy, k);
                     rho1d(k) = mg.rho3d_loc(ix, iy, k);
                 } else {
-                    const real_t mean_vs = IP.inversion().model_para_type == MODEL_RADIAL_ANI
-                        ? vsvvsh2vs(mg.vs3d_loc(ix, iy, k), mg.vsh3d_loc(ix, iy, k))
-                        : vs1d(k);
-                    vp1d(k) = vs2vp(mean_vs);
+                    vp1d(k) = vs2vp(vs1d(k));
                     rho1d(k) = vp2rho(vp1d(k));
                 }
             }
@@ -322,11 +317,10 @@ void SurfGrid::compute_dispersion_kernel() {
             vs_block = kernels.sen_vs.transpose();
             if (wt_ == WaveType::RL){
                 Eigen::Map<MatRM> vp_block(sen_vp_loc.data() + id0, ngrid_k, nperiod_);
+                Eigen::Map<MatRM> rho_block(sen_rho_loc.data() + id0, ngrid_k, nperiod_);
                 vp_block = kernels.sen_vp.transpose();
+                rho_block = kernels.sen_rho.transpose();
             }
-            // Love also has a density kernel; radial empirical scaling needs it.
-            Eigen::Map<MatRM> rho_block(sen_rho_loc.data() + id0, ngrid_k, nperiod_);
-            rho_block = kernels.sen_rho.transpose();
             if (IP.inversion().model_para_type == MODEL_AZI_ANI) {
                 Eigen::Map<MatRM> gc_block(sen_gc_loc.data() + id0, ngrid_k, nperiod_);
                 Eigen::Map<MatRM> gs_block(sen_gs_loc.data() + id0, ngrid_k, nperiod_);

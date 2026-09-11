@@ -329,9 +329,14 @@ void Inversion::accumulate_smoothed_gradient(
     };
 
     if (model_para_type == MODEL_RADIAL_ANI) {
-        // Both wave types contribute independent Vsv and Vsh partials.
-        accumulate_grad(0, true);
-        accumulate_grad(5, false);  // also needed by the existing radial conversion
+        if (wt == WaveType::RL) {
+            for (int ipara = 0; ipara < 3; ++ipara) {
+                accumulate_grad(ipara, true);
+            }
+        } else if (wt == WaveType::LV) {
+            // Keep previous behavior: gamma term is always accumulated for Love in radial anisotropy.
+            accumulate_grad(NPARAMS - 1, false);
+        }
         return;
     }
 
@@ -375,9 +380,15 @@ real_t Inversion::run_forward_adjoint(const bool is_calc_adj) {
             if (IP.inversion().optim_method == OPTIM_LBFGS) {
                 const real_t wt_val = IP.data().weights[itype];
                 if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
-                    // Physical partials in independent (Vsv, Vsh), for both waves.
-                    ker_curr_[0] += sg.ker_loc[0] * wt_val;
-                    ker_curr_[5] += sg.ker_loc[5] * wt_val;
+                    // For radial anisotropy, Love kernel lives in ker_loc[0] and contributes
+                    // to the gamma (index 5) direction; Rayleigh only updates vs/vp/rho.
+                    if (wt == WaveType::RL) {
+                        for (int ipara = 0; ipara < 3; ++ipara)
+                            if (is_active_param[ipara])
+                                ker_curr_[ipara] = ker_curr_[ipara] + sg.ker_loc[ipara] * wt_val;
+                    } else {
+                        ker_curr_[5] = ker_curr_[5] + sg.ker_loc[0] * wt_val;
+                    }
                 } else {
                     for (int ipara = 0; ipara < NPARAMS; ++ipara)
                         if (is_active_param[ipara])
@@ -642,6 +653,10 @@ void Inversion::model_update(FieldVec &dir) {
         mg.vp3d_loc = mg.vp3d_loc * (1 - alpha_ * dir[1]);
         mg.rho3d_loc = mg.rho3d_loc * (1 - alpha_ * dir[2]);
         alpha_clamp();
+    } else {
+        // Empirical scaling: vs → vp → rho via Brocher (2005)
+        mg.vp3d_loc  = vs2vp(mg.vs3d_loc);
+        mg.rho3d_loc = vp2rho(mg.vp3d_loc);
     }
     if (IP.inversion().model_para_type == MODEL_AZI_ANI) {
         mg.gc3d_loc = mg.gc3d_loc - alpha_ * dir[3];
@@ -650,13 +665,6 @@ void Inversion::model_update(FieldVec &dir) {
     if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
         mg.gamma3d_loc = mg.gamma3d_loc * (1 - alpha_ * dir[5]);
         mg.vsh3d_loc = mg.vs3d_loc * mg.gamma3d_loc;
-    }
-    if (!IP.inversion().use_alpha_beta_rho) {
-        // Recompute only after both Vsv and Vsh have been updated.
-        const Tensor3r mean_vs = IP.inversion().model_para_type == MODEL_RADIAL_ANI
-            ? vsvvsh2vs(mg.vs3d_loc, mg.vsh3d_loc) : mg.vs3d_loc;
-        mg.vp3d_loc = vs2vp(mean_vs);
-        mg.rho3d_loc = vp2rho(mg.vp3d_loc);
     }
     mpi.barrier();
 }
