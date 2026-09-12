@@ -63,13 +63,14 @@ real_t calc_descent_angle(const FieldVec &direction, const FieldVec &gradient) {
 // field_dot_global  — MPI-reduced directional derivative magnitude
 // ---------------------------------------------------------------------------
 // The adjoint kernels are densities over the horizontal surface, while their
-// depth dimension already consists of discrete layer sensitivities (dc/dm_k).
-// The search direction, however, is applied multiplicatively to vs/vp/rho/gamma
-// and additively to gc/gs.  Therefore this routine includes both the horizontal
-// quadrature weight and the chain rule from alpha to the physical model:
+// depth dimension already consists of discrete layer sensitivities.  This
+// routine therefore adds only the horizontal quadrature weight.
 //
-//   m(alpha) = m0 (1 - alpha*d)  =>  -dm/dalpha = m0*d
-//   m(alpha) = m0 - alpha*d      =>  -dm/dalpha = d .
+// No per-parameter chain rule from alpha to the physical model is needed:
+// combine_kernels() already returns dchi/dln(m) for the multiplicatively
+// updated parameters (vs/vp/rho/gamma) and dchi/dm for the additive ones
+// (gc/gs), so in both cases the step is x(alpha) = x0 - alpha*d and
+// -dx/dalpha = d.
 //
 // dlon_i and dlat_j are nodal quadrature widths.  End points receive half of
 // the adjacent interval, as in the trapezoidal rule.  No dz factor is added.

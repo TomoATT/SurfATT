@@ -289,17 +289,25 @@ void preproc::combine_kernels(SurfGrid& sg) {
                         const real_t vp  = mg.vp3d_loc(ix, iy, k);
                         const real_t dab = dalpha_dbeta(vs);   // d(vp)/d(vs)
                         const real_t dra = drho_dalpha(vp);    // d(rho)/d(vp)
-                        sg.ker_loc[0](ix, iy, k) -= att * (
-                            sg.sen_vs_loc(ix, iy, k, iper)
-                            + sg.sen_vp_loc(ix, iy, k, iper)  * dab
-                            + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
-                        );
-                        if (IP.postproc().is_kden) {
-                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * (
+                        if ( IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+                            sg.ker_loc[0](ix, iy, k) -= att * sg.sen_vs_loc(ix, iy, k, iper);
+                            if (IP.postproc().is_kden) {
+                                sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * sg.sen_vs_loc(ix, iy, k, iper);
+                            }
+                        } else {
+                            sg.ker_loc[0](ix, iy, k) -= att * (
                                 sg.sen_vs_loc(ix, iy, k, iper)
                                 + sg.sen_vp_loc(ix, iy, k, iper)  * dab
                                 + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
                             );
+                        
+                            if (IP.postproc().is_kden) {
+                                sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * (
+                                    sg.sen_vs_loc(ix, iy, k, iper)
+                                    + sg.sen_vp_loc(ix, iy, k, iper)  * dab
+                                    + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
+                                );
+                            }
                         }
                     }
                 }
