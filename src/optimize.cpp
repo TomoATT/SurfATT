@@ -66,11 +66,10 @@ real_t calc_descent_angle(const FieldVec &direction, const FieldVec &gradient) {
 // depth dimension already consists of discrete layer sensitivities.  This
 // routine therefore adds only the horizontal quadrature weight.
 //
-// No per-parameter chain rule from alpha to the physical model is needed:
-// combine_kernels() already returns dchi/dln(m) for the multiplicatively
-// updated parameters (vs/vp/rho/gamma) and dchi/dm for the additive ones
-// (gc/gs), so in both cases the step is x(alpha) = x0 - alpha*d and
-// -dx/dalpha = d.
+// The line-search derivative includes the model-update chain rule below:
+// for multiplicative parameters, -dm/dalpha = m*d; for additive gc/gs,
+// -dm/dalpha = d. The directional derivative therefore uses the physical
+// model values for vs/vp/rho and gamma before applying the horizontal weight.
 //
 // dlon_i and dlat_j are nodal quadrature widths.  End points receive half of
 // the adjacent interval, as in the trapezoidal rule.  No dz factor is added.
