@@ -294,6 +294,7 @@ void preproc::combine_kernels(SurfGrid& sg) {
                             + sg.sen_vp_loc(ix, iy, k, iper)  * dab
                             + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
                         );
+
                         if (IP.postproc().is_kden) {
                             sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * (
                                 sg.sen_vs_loc(ix, iy, k, iper)

@@ -59,6 +59,7 @@ private:
     void grad_normalization(FieldVec &grads);
     void store_model();
     void store_gradient();
+    void store_kernel_density();
     bool check_convergence();
     void model_update(FieldVec &dir);
     bool line_search();
