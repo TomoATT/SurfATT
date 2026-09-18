@@ -93,6 +93,9 @@ void write_model_iter(const std::string &xdmf_path, int iter,
                 out << attr("grad_gc", "grad_gc" + sfx)
                     << attr("grad_gs", "grad_gs" + sfx);
             }
+            if (IP.postproc().is_kden) {
+                out << attr("kernel_density", "kernel_density" + sfx);
+            }
         }
         out << "      </Grid>\n";
     }

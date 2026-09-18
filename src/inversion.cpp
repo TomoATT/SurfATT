@@ -199,6 +199,10 @@ void Inversion::run_inversion() {
 
         write_obj_line();
 
+        if (IP.postproc().is_kden) {
+            store_kernel_density();
+        }
+
         if (IP.output().output_in_process_model || IP.inversion().optim_method == OPTIM_LBFGS) {
             store_gradient();
         }
@@ -494,6 +498,30 @@ void Inversion::store_gradient() {
     // (0..iter_) show both model and gradient fields.
     if (!xdmf_fname_.empty())
         xdmf::write_model_iter(xdmf_fname_, iter_, iter_);
+}
+
+// Save the total kernel density used during the current inversion iteration.
+// Each active data type contributes according to its phase/group data weight.
+// Dataset names follow the model/gradient convention: kernel_density_{N}.
+void Inversion::store_kernel_density() {
+    auto &IP  = InputParams::IP();
+    auto &dcp = Decomposer::DCP();
+    auto &mpi = Parallel::mpi();
+
+    Tensor3r density_loc(dcp.loc_nx(), dcp.loc_ny(), ngrid_k);
+    density_loc.setZero();
+    for (auto [wt, tp] : IP.data().active_data) {
+        const int itype = static_cast<int>(tp);
+        density_loc += SurfGrid::SG(wt, tp).ker_den_loc * IP.data().weights[itype];
+    }
+
+    // collect_data is collective: all ranks participate, then only the main
+    // rank owns and writes the assembled global volume.
+    Tensor3r density_all = dcp.collect_data(density_loc.data());
+    if (!mpi.is_main()) return;
+
+    H5IO f(db_fname, H5IO::RDWR);
+    f.write_tensor(fmt::format("kernel_density_{:03d}", iter_), density_all);
 }
 
 void Inversion::steepest_descent() {

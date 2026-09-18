@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project( SurfATT VERSION 2.1.1 LANGUAGES CXX Fortran)
+project( SurfATT VERSION 2.1.2 LANGUAGES CXX Fortran)
 
 include(GNUInstallDirs)
 
