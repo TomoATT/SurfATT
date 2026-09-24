@@ -4,13 +4,152 @@
 #include "utils.h"
 #include "input_params.h"
 #include "src_rec.h"
+#include "parallel.h"
+#include <cmath>
 #include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int MAX_BAD_ROWS_SHOWN = 10;
+
+std::string data_tag(WaveType wt, SurfType tp) {
+    return waveTypeStr[static_cast<int>(wt)] + (tp == SurfType::PH ? "_PH" : "_GR");
+}
+
+// Summarise bad CSV rows: total count plus the first few as
+// "line N (value)". CSV line = data row index + 2 (header is line 1).
+std::string bad_rows_msg(const std::vector<int>& rows, const real_t* col) {
+    std::string msg = fmt::format("{} row(s):", rows.size());
+    for (size_t i = 0; i < rows.size() && i < MAX_BAD_ROWS_SHOWN; ++i) {
+        msg += fmt::format(" line {} ({})", rows[i] + 2, col[rows[i]]);
+    }
+    if (rows.size() > MAX_BAD_ROWS_SHOWN) msg += " ...";
+    return msg;
+}
+
+}  // namespace
 
 Inversion1D::Inversion1D(WaveType wavetype)
     : wavetype_(wavetype) {
     niter = 0;
     misfits.clear();
     vs1d.resize(0);
+}
+
+void Inversion1D::check_inputs(const Eigen::VectorX<real_t>& zarr) const {
+    auto& IP = InputParams::IP();
+    auto& logger = ATTLogger::logger();
+    int n_err = 0;
+    auto error = [&](const std::string& msg) {
+        logger.Error(msg, MODULE_INV1D);
+        ++n_err;
+    };
+
+    // 1. Depth grid: finite and strictly increasing (layer thickness > 0)
+    const int nz = static_cast<int>(zarr.size());
+    if (nz < 2) {
+        error(fmt::format("Depth grid has {} node(s); need >= 2. Check domain.depth_min_max / interval.", nz));
+    }
+    for (int k = 0; k < nz; ++k) {
+        if (!std::isfinite(zarr(k))) {
+            error(fmt::format("Depth grid node {} is non-finite ({})", k, zarr(k)));
+        } else if (k > 0 && !(zarr(k) > zarr(k - 1))) {
+            error(fmt::format("Depth grid not strictly increasing at node {}: z={} <= z[{}]={}",
+                k, zarr(k), k - 1, zarr(k - 1)));
+        }
+    }
+
+    // 2. Initial Vs: finite and positive at every node
+    for (int k = 0; k < vs1d.size(); ++k) {
+        if (!std::isfinite(vs1d(k)) || vs1d(k) <= _0_CR) {
+            error(fmt::format("Initial Vs invalid at node {} (z={} km): Vs={}. Check model.vel_range.",
+                k, k < nz ? zarr(k) : NAN, vs1d(k)));
+        }
+    }
+
+    // 3. Active src_rec tables for this wave type
+    for (auto [wt, tp] : IP.data().active_data) {
+        if (wt != wavetype_) continue;
+        auto& sr = SrcRec::SR(wt, tp);
+        const std::string tag = data_tag(wt, tp);
+        const std::string& file = IP.data().file_of(wt, tp);
+
+        std::vector<int> bad_period, bad_vel;
+        for (int i = 0; i < sr.n_obs(); ++i) {
+            if (!std::isfinite(sr.period_all[i]) || sr.period_all[i] <= _0_CR) bad_period.push_back(i);
+            if (!std::isfinite(sr.vel[i]) || sr.vel[i] <= _0_CR) bad_vel.push_back(i);
+        }
+        if (!bad_period.empty()) {
+            error(fmt::format("[{}] {}: 'period' must be finite and > 0 (disper cannot search "
+                "a non-positive/NaN period); {}", tag, file, bad_rows_msg(bad_period, sr.period_all)));
+        }
+        if (!bad_vel.empty()) {
+            error(fmt::format("[{}] {}: 'vel' (or dist/tt) must be finite and > 0; {}",
+                tag, file, bad_rows_msg(bad_vel, sr.vel)));
+        }
+
+        const auto& pinfo = sr.periods_info;
+        if (pinfo.nperiod <= 0) {
+            error(fmt::format("[{}] {}: no periods found (empty table?)", tag, file));
+            continue;
+        }
+        for (int ip = 0; ip < pinfo.nperiod; ++ip) {
+            if (!std::isfinite(pinfo.meanvel(ip)) || pinfo.meanvel(ip) <= _0_CR) {
+                error(fmt::format("[{}] {}: mean velocity at period {} s is invalid ({})",
+                    tag, file, pinfo.periods(ip), pinfo.meanvel(ip)));
+            }
+            // Distinct values closer than real_t_equal's tolerance are split
+            // into separate periods by get_periods(); usually a formatting issue.
+            if (ip > 0 && std::isfinite(pinfo.periods(ip)) &&
+                real_t_equal(pinfo.periods(ip), pinfo.periods(ip - 1))) {
+                logger.Warn(fmt::format("[{}] {}: near-duplicate periods {} and {} are treated as different periods",
+                    tag, file, pinfo.periods(ip - 1), pinfo.periods(ip)), MODULE_INV1D);
+            }
+        }
+        std::string plist;
+        for (int ip = 0; ip < pinfo.nperiod; ++ip) plist += fmt::format(" {}", pinfo.periods(ip));
+        logger.Debug(fmt::format("  [{}] {} rows, {} periods:{}", tag, sr.n_obs(), pinfo.nperiod, plist),
+            MODULE_INV1D);
+    }
+
+    if (n_err > 0) {
+        logger.Error(fmt::format("1D inversion input check failed with {} error(s); see messages above.", n_err),
+            MODULE_INV1D);
+        Parallel::mpi().abort(EXIT_FAILURE);
+    }
+}
+
+void Inversion1D::check_pred_vel(const Eigen::VectorX<real_t>& pred_vel,
+                                 const Eigen::VectorX<real_t>& periods,
+                                 const Eigen::VectorX<real_t>& zarr,
+                                 int iter, WaveType wt, SurfType tp) const {
+    int first_bad = -1;
+    for (int ip = 0; ip < pred_vel.size(); ++ip) {
+        if (!std::isfinite(pred_vel(ip)) || pred_vel(ip) <= _0_CR) { first_bad = ip; break; }
+    }
+    if (first_bad < 0) return;
+
+    auto& logger = ATTLogger::logger();
+    logger.Error(fmt::format(
+        "[{}] iter {}: dispersion solver found no fundamental-mode root from period {} s "
+        "(index {} of {}); predicted velocities from here on are 0.",
+        data_tag(wt, tp), iter, periods(first_bad), first_bad, periods.size()), MODULE_INV1D);
+
+    std::string prof;
+    for (int k = 0; k < vs1d.size(); ++k) prof += fmt::format(" {:.2f}:{:.4f}", zarr(k), vs1d(k));
+    logger.Error(fmt::format("  Vs min={:.4f}, max={:.4f} km/s; profile (z:Vs):{}",
+        vs1d.minCoeff(), vs1d.maxCoeff(), prof), MODULE_INV1D);
+
+    for (int k = 0; k < vs1d.size(); ++k) {
+        if (!std::isfinite(vs1d(k)) || vs1d(k) <= _0_CR) {
+            logger.Error(fmt::format("  Likely cause: Vs at node {} (z={} km) is {} after {} update(s).",
+                k, zarr(k), vs1d(k), iter), MODULE_INV1D);
+            break;
+        }
+    }
+    Parallel::mpi().abort(EXIT_FAILURE);
 }
 
 Eigen::VectorX<real_t> Inversion1D::inv1d(
@@ -61,6 +200,8 @@ Eigen::VectorX<real_t> Inversion1D::inv1d(
         MODULE_INV1D
     );
 
+    check_inputs(zarr);
+
     // define model update vector
     Eigen::VectorX<real_t> update(nz);
     Eigen::VectorX<real_t> update_total(nz);
@@ -82,6 +223,7 @@ Eigen::VectorX<real_t> Inversion1D::inv1d(
             );
 
             Eigen::VectorX<real_t> pred_vel = surfker::surfdisp(req);
+            check_pred_vel(pred_vel, sr.periods_info.periods, zarr, iter, wt, tp);
             real_t misfit = 0.5 * (pred_vel - sr.periods_info.meanvel).array().square().sum();
             logger.Debug(
                 fmt::format("  iter {:3d} | {}_{} misfit={:.6e} (weight={:.3f})",
@@ -120,7 +262,15 @@ Eigen::VectorX<real_t> Inversion1D::inv1d(
         if (iter > 0 && misfits[iter] > misfits[iter - 1]) {
             step_length *= IP.inversion().maxshrink;
         }
-        update_total = step_length * update_total / update_total.lpNorm<Eigen::Infinity>();
+        const real_t update_norm = update_total.lpNorm<Eigen::Infinity>();
+        if (!std::isfinite(update_norm)) {
+            logger.Error(fmt::format("iter {}: model update is non-finite ({}); check data and kernels.",
+                iter, update_norm), MODULE_INV1D);
+            Parallel::mpi().abort(EXIT_FAILURE);
+        }
+        if (update_norm > _0_CR) {
+            update_total = step_length * update_total / update_norm;
+        }  // zero update (perfect fit) would otherwise give 0/0 = NaN
 
         logger.Debug(
             fmt::format("Iteration {}: misfit = {:.6e}, step_length = {:.3e}", iter, misfits.back(), step_length),

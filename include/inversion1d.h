@@ -26,4 +26,14 @@ private:
 
     int niter;
     std::vector<real_t> misfits;
+
+    // Validate depth grid, initial Vs and the active src_rec tables before
+    // the first forward call; logs every problem found and aborts if any.
+    void check_inputs(const Eigen::VectorX<real_t>& zarr) const;
+
+    // Abort with a diagnostic if disper() failed (returned 0 / non-finite).
+    void check_pred_vel(const Eigen::VectorX<real_t>& pred_vel,
+                        const Eigen::VectorX<real_t>& periods,
+                        const Eigen::VectorX<real_t>& zarr,
+                        int iter, WaveType wt, SurfType tp) const;
 };
