@@ -3,8 +3,15 @@
 #include "config.h"
 
 #include <Eigen/Core>
+#include <string>
 
 namespace surfker {
+
+// Diagnostics of "no zero found in fundamental mode" failures raised by the
+// dispersion solver during the calls made since the last reset (per thread).
+void reset_disper_diag();
+int disper_fail_count();
+const std::string &disper_fail_report();  // report of the first failure
 
 struct DispersionRequest {
     Eigen::VectorX<real_t> thickness_km;

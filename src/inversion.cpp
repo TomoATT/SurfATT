@@ -8,6 +8,169 @@
 #include <cmath>
 #include <fstream>
 
+// Summarise the local model slices over all ranks and log them, so the drift
+// of the model towards states where the dispersion solver fails ("no zero
+// found in fundamental mode") can be followed in the log:
+//   - non-finite or non-positive vs/vp/rho/vsh, vp/vs out of range;
+//   - columns whose last depth node (the halfspace) is slower than a node
+//     above it, which lets long-period phase velocities exceed the
+//     halfspace Vs so that no trapped fundamental mode exists;
+//   - non-finite search directions, or a step that would flip the sign of a
+//     multiplicatively updated parameter.
+// With depth_profile, also log the min/max vs at every depth node.
+// Collective: must be called on all ranks.
+static void log_model_check(const std::string &stage,
+                            const FieldVec *dir = nullptr, real_t alpha = _0_CR,
+                            bool depth_profile = false) {
+    auto &mg = ModelGrid::MG();
+    auto &IP = InputParams::IP();
+    auto &mpi = Parallel::mpi();
+    auto &logger = ATTLogger::logger();
+    const bool radial = IP.inversion().model_para_type == MODEL_RADIAL_ANI;
+
+    struct Stat {
+        real_t vmin = REAL_MAX, vmax = REAL_MIN;
+        int n_nonfinite = 0, n_nonpos = 0;
+        void add(real_t v) {
+            if (!std::isfinite(v)) { ++n_nonfinite; return; }
+            if (v <= _0_CR) ++n_nonpos;
+            vmin = std::min(vmin, v);
+            vmax = std::max(vmax, v);
+        }
+        void reduce(Parallel &mpi) {
+            real_t lo = vmin, hi = vmax;
+            int nf = n_nonfinite, np = n_nonpos;
+            mpi.min_all_all(lo, vmin);
+            mpi.max_all_all(hi, vmax);
+            mpi.sum_all_all(nf, n_nonfinite);
+            mpi.sum_all_all(np, n_nonpos);
+        }
+    };
+    Stat vs, vp, rho, vpvs, vsh;
+    // columns whose bottom node is slower than the fastest node above it
+    int n_slow_bottom = 0, n_slow_bottom_vsh = 0, n_col = 0;
+    real_t worst_ratio = _1_CR, worst_ratio_vsh = _1_CR;
+    // max vs and -min vs at each depth node (both reduced with MPI_MAX)
+    std::vector<real_t> depth_max(ngrid_k, REAL_MIN), depth_negmin(ngrid_k, REAL_MIN);
+
+    const int nx = static_cast<int>(mg.vs3d_loc.dimension(0));
+    const int ny = static_cast<int>(mg.vs3d_loc.dimension(1));
+    const int nz = static_cast<int>(mg.vs3d_loc.dimension(2));
+    for (int ix = 0; ix < nx; ++ix) {
+        for (int iy = 0; iy < ny; ++iy) {
+            ++n_col;
+            real_t vs_above = _0_CR, vsh_above = _0_CR;
+            for (int iz = 0; iz < nz; ++iz) {
+                const real_t s = mg.vs3d_loc(ix, iy, iz);
+                const real_t p = mg.vp3d_loc(ix, iy, iz);
+                if (std::isfinite(s)) {
+                    depth_max[iz] = std::max(depth_max[iz], s);
+                    depth_negmin[iz] = std::max(depth_negmin[iz], -s);
+                }
+                vs.add(s);
+                vp.add(p);
+                rho.add(mg.rho3d_loc(ix, iy, iz));
+                if (s != _0_CR) vpvs.add(p / s);
+                if (iz < nz - 1 && std::isfinite(s)) vs_above = std::max(vs_above, s);
+                if (radial) {
+                    const real_t h = mg.vsh3d_loc(ix, iy, iz);
+                    vsh.add(h);
+                    if (iz < nz - 1 && std::isfinite(h)) vsh_above = std::max(vsh_above, h);
+                }
+            }
+            const real_t s_bot = mg.vs3d_loc(ix, iy, nz - 1);
+            if (s_bot > _0_CR && vs_above > s_bot) {
+                ++n_slow_bottom;
+                worst_ratio = std::max(worst_ratio, vs_above / s_bot);
+            }
+            if (radial) {
+                const real_t h_bot = mg.vsh3d_loc(ix, iy, nz - 1);
+                if (h_bot > _0_CR && vsh_above > h_bot) {
+                    ++n_slow_bottom_vsh;
+                    worst_ratio_vsh = std::max(worst_ratio_vsh, vsh_above / h_bot);
+                }
+            }
+        }
+    }
+
+    // Search direction: non-finite entries, and the smallest multiplicative
+    // factor (1 - alpha*dir) applied to vs/vp/rho/gamma.
+    int n_dir_nonfinite = 0;
+    real_t min_factor = REAL_MAX;
+    if (dir) {
+        for (int p = 0; p < NPARAMS; ++p) {
+            if (!is_active_param[p] || (*dir)[p].size() == 0) continue;
+            const real_t *d = (*dir)[p].data();
+            const bool multiplicative = (p < 3 || p == 5);
+            for (Eigen::Index i = 0; i < (*dir)[p].size(); ++i) {
+                if (!std::isfinite(d[i])) { ++n_dir_nonfinite; continue; }
+                if (multiplicative) min_factor = std::min(min_factor, _1_CR - alpha * d[i]);
+            }
+        }
+    }
+
+    vs.reduce(mpi);
+    vp.reduce(mpi);
+    rho.reduce(mpi);
+    vpvs.reduce(mpi);
+    if (radial) vsh.reduce(mpi);
+    int n_slow_bottom_all = 0, n_slow_bottom_vsh_all = 0, n_col_all = 0, n_dir_nonfinite_all = 0;
+    real_t worst_ratio_all = _1_CR, worst_ratio_vsh_all = _1_CR, min_factor_all = REAL_MAX;
+    mpi.sum_all_all(n_slow_bottom, n_slow_bottom_all);
+    mpi.sum_all_all(n_slow_bottom_vsh, n_slow_bottom_vsh_all);
+    mpi.sum_all_all(n_col, n_col_all);
+    mpi.max_all_all(worst_ratio, worst_ratio_all);
+    mpi.max_all_all(worst_ratio_vsh, worst_ratio_vsh_all);
+    mpi.sum_all_all(n_dir_nonfinite, n_dir_nonfinite_all);
+    mpi.min_all_all(min_factor, min_factor_all);
+    mpi.max_allreduce(depth_max.data(), ngrid_k);
+    mpi.max_allreduce(depth_negmin.data(), ngrid_k);
+
+    // Depths of the global vs extremes.
+    int k_max = 0, k_min = 0;
+    for (int k = 1; k < ngrid_k; ++k) {
+        if (depth_max[k] > depth_max[k_max]) k_max = k;
+        if (depth_negmin[k] > depth_negmin[k_min]) k_min = k;
+    }
+
+    std::string msg = fmt::format(
+        "Model check [{}]: vs [{:.4f}, {:.4f}] (min at z={:.3f} km, max at z={:.3f} km; "
+        "deepest node z={:.3f} km: [{:.4f}, {:.4f}]), vp [{:.4f}, {:.4f}], rho [{:.4f}, {:.4f}], "
+        "vp/vs [{:.4f}, {:.4f}]",
+        stage, vs.vmin, vs.vmax, mg.zgrids(k_min), mg.zgrids(k_max),
+        mg.zgrids(ngrid_k - 1), -depth_negmin[ngrid_k - 1], depth_max[ngrid_k - 1],
+        vp.vmin, vp.vmax, rho.vmin, rho.vmax, vpvs.vmin, vpvs.vmax);
+    if (radial) msg += fmt::format(", vsh [{:.4f}, {:.4f}]", vsh.vmin, vsh.vmax);
+    msg += fmt::format("; columns with bottom node slower than a node above: {}/{} (worst vs_max_above/vs_bottom = {:.4f})",
+                       n_slow_bottom_all, n_col_all, worst_ratio_all);
+    if (radial)
+        msg += fmt::format(", vsh: {}/{} (worst {:.4f})",
+                           n_slow_bottom_vsh_all, n_col_all, worst_ratio_vsh_all);
+    if (dir) msg += fmt::format("; alpha={:.6e}, min(1-alpha*dir)={:.6f}", alpha, min_factor_all);
+
+    const int n_bad = vs.n_nonfinite + vs.n_nonpos + vp.n_nonfinite + vp.n_nonpos +
+                      rho.n_nonfinite + rho.n_nonpos + vsh.n_nonfinite + vsh.n_nonpos +
+                      vpvs.n_nonfinite + n_dir_nonfinite_all;
+    if (n_bad > 0 || (vpvs.vmin <= _1_CR) || (dir && min_factor_all <= _0_CR)) {
+        msg += fmt::format(
+            "\n  ANOMALY: non-finite vs/vp/rho/vsh/vpvs = {}/{}/{}/{}/{}, non-positive vs/vp/rho/vsh = {}/{}/{}/{}, "
+            "non-finite search-direction entries = {}{}",
+            vs.n_nonfinite, vp.n_nonfinite, rho.n_nonfinite, vsh.n_nonfinite, vpvs.n_nonfinite,
+            vs.n_nonpos, vp.n_nonpos, rho.n_nonpos, vsh.n_nonpos, n_dir_nonfinite_all,
+            (dir && min_factor_all <= _0_CR) ? ", step flips the sign of a parameter (1-alpha*dir <= 0)" : "");
+        logger.Warn(msg, MODULE_INV);
+    } else {
+        logger.Info(msg, MODULE_INV);
+    }
+
+    if (depth_profile) {
+        std::string prof = fmt::format("Model check [{}]: vs by depth (z_km: min/max)", stage);
+        for (int k = 0; k < ngrid_k; ++k)
+            prof += fmt::format(" | {:.2f}: {:.3f}/{:.3f}", mg.zgrids(k), -depth_negmin[k], depth_max[k]);
+        logger.Info(prof, MODULE_INV);
+    }
+}
+
 static void distribute_model_para(){
     auto& mg = ModelGrid::MG();
     auto& dcp = Decomposer::DCP();
@@ -131,7 +294,9 @@ Inversion::Inversion() {
 void Inversion::run_forward() {
     auto& logger = ATTLogger::logger();
     logger.Info("Running forward calculation...", MODULE_INV);
+    diag_context = "forward";
     distribute_model_para();
+    log_model_check(diag_context, nullptr, _0_CR, true);
     run_forward_adjoint(false);
     write_src_rec_fwd();
 }
@@ -178,6 +343,7 @@ void Inversion::run_inversion() {
 
     for ( iter_ = 0; iter_ < IP.inversion().niter; ++iter_ ) {
         logger.Info(fmt::format("Starting inversion {}th iteration ...", iter_), MODULE_INV);
+        diag_context = fmt::format("iter {}", iter_);
         // Initialize the iteration: distribute the current model to local subdomains, reset model update and search direction
         init_iteration();
 
@@ -252,6 +418,7 @@ void Inversion::init_iteration() {
 
     // Distribute the updated global model to per-rank local slices before fwdsurf().
     distribute_model_para();
+    log_model_check(diag_context + " start", nullptr, _0_CR, true);
 
     // initialize kernel for current and previous iteration to zero
     if (IP.inversion().optim_method == OPTIM_LBFGS){
@@ -551,6 +718,7 @@ void Inversion::steepest_descent() {
     gradient_prev_ = gradient_;
 
     // Pass gradient directly; model_update applies model -= alpha * gradient (descent).
+    diag_context = fmt::format("iter {} steepest-descent update", iter_);
     model_update(gradient_);
     mg.collect_model_loc();  // gather the updated local model back to the global model
 }
@@ -609,6 +777,7 @@ bool Inversion::line_search() {
 
         // Reset local model slices from the global (pre-line-search) model before
         // each trial step, so sub-iterations are independent of each other.
+        diag_context = fmt::format("iter {} line-search trial {} alpha={:.6e}", iter_, sub_iter, alpha_);
         distribute_model_para();
         model_update(search_dir);
 
@@ -666,6 +835,7 @@ void Inversion::model_update(FieldVec &dir) {
         mg.gamma3d_loc = mg.gamma3d_loc * (1 - alpha_ * dir[5]);
         mg.vsh3d_loc = mg.vs3d_loc * mg.gamma3d_loc;
     }
+    log_model_check(diag_context, &dir, alpha_);
     mpi.barrier();
 }
 

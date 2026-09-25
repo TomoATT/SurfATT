@@ -9,7 +9,71 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <sstream>
+#include <string>
 #include <vector>
+
+
+/* ------------------------------------------------------------------ */
+/* Failure diagnostics                                                  */
+/* ------------------------------------------------------------------ */
+
+/* What getsol() did while bracketing a root (filled for diagnostics). */
+struct GetsolTrace {
+    enum Reason { OK = 0, ROOT_ABOVE_BETMX, PASSED_BETMX, BELOW_CM, STEP_CAP };
+    double c_start = 0.0;   /* phase velocity where the bracket search started */
+    double del_start = 0.0; /* period-equation value at c_start */
+    int    idir    = 0;     /* initial search direction (+1 up, -1 down) */
+    long   nstep   = 0;     /* number of dc steps taken */
+    double c_end   = 0.0;   /* last velocity tested, or the root found */
+    int    reason  = OK;
+};
+
+static const char *getsol_reason_str(int reason)
+{
+    switch (reason) {
+    case GetsolTrace::OK:               return "ok";
+    case GetsolTrace::ROOT_ABOVE_BETMX: return "root found but above betmx (max Vs of the column)";
+    case GetsolTrace::PASSED_BETMX:     return "no sign change of the period equation up to betmx+dc";
+    case GetsolTrace::BELOW_CM:         return "search went below the lower bound cm";
+    case GetsolTrace::STEP_CAP:         return "step limit reached (non-finite period equation?)";
+    default:                            return "unknown";
+    }
+}
+
+/* State since the last disper_diag_reset() on this thread. */
+static thread_local int         g_nfail_since_reset = 0;
+static thread_local std::string g_first_report;
+/* Per-process count used to rate-limit the stderr output. */
+static long g_nfail_total = 0;
+constexpr long MAX_FULL_REPORTS  = 3;    /* full reports written to stderr */
+constexpr long MAX_SHORT_REPORTS = 100;  /* one-line reports after that */
+
+void disper_diag_reset()
+{
+    g_nfail_since_reset = 0;
+    g_first_report.clear();
+}
+
+int disper_diag_nfail() { return g_nfail_since_reset; }
+
+const std::string &disper_diag_report() { return g_first_report; }
+
+static void record_failure(const std::string &summary, const std::string &report)
+{
+    ++g_nfail_since_reset;
+    if (g_first_report.empty()) g_first_report = report;
+
+    ++g_nfail_total;
+    if (g_nfail_total <= MAX_FULL_REPORTS) {
+        fprintf(stderr, "%s", report.c_str());
+    } else if (g_nfail_total <= MAX_FULL_REPORTS + MAX_SHORT_REPORTS) {
+        fprintf(stderr, "%s\n", summary.c_str());
+    } else if (g_nfail_total == MAX_FULL_REPORTS + MAX_SHORT_REPORTS + 1) {
+        fprintf(stderr, "WARNING: disper: further failure reports on this process are suppressed\n");
+    }
+    fflush(stderr);
+}
 
 
 /* ------------------------------------------------------------------ */
@@ -22,7 +86,7 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
                    double betmx, int &iret, int ifunc, int ifirst,
                    float *d, float *a, float *b, float *rho,
                    float *rtp, float *dtp, float *btp, int mmax, int llw,
-                   double &del1st);
+                   double &del1st, GetsolTrace *trace = nullptr);
 
 static void sphere_func(int ifunc, int iflag,
                         float *d, float *a, float *b, float *rho,
@@ -547,7 +611,7 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
                    double betmx, int &iret, int ifunc, int ifirst,
                    float *d, float *a, float *b, float *rho,
                    float *rtp, float *dtp, float *btp, int mmax, int llw,
-                   double &del1st)
+                   double &del1st, GetsolTrace *trace)
 {
     double omega = TWOPI / t1;
     double wvno  = omega / c1;
@@ -564,7 +628,28 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
     else
         idir = -1;
 
+    GetsolTrace local_trace;
+    GetsolTrace &tr = trace ? *trace : local_trace;
+    tr = GetsolTrace();
+    tr.c_start   = c1;
+    tr.del_start = del1;
+    tr.idir      = idir;
+
+    /* A healthy search needs at most ~(betmx+dc)/dc steps up plus the same
+     * down; the cap only stops endless loops on non-finite values (NaN
+     * compares false everywhere, so the exit tests below never fire). */
+    long max_steps = 1000000;
+    if (std::isfinite(betmx) && dc > 0.0)
+        max_steps = std::min(max_steps, 10L * (long)((betmx + dc) / dc) + 1000L);
+
     while (true) {
+        if (++tr.nstep > max_steps) {
+            tr.c_end  = c1;
+            tr.reason = GetsolTrace::STEP_CAP;
+            iret = -1;
+            return;
+        }
+
         double c2;
         if (idir > 0)
             c2 = c1 + dc;
@@ -587,6 +672,8 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
                    d, a, b, rho, rtp, dtp, btp, mmax, llw);
             c1   = cn;
             iret = (c1 > betmx) ? -1 : 1;
+            tr.c_end  = c1;
+            tr.reason = (iret == -1) ? GetsolTrace::ROOT_ABOVE_BETMX : GetsolTrace::OK;
             return;
         }
 
@@ -594,9 +681,120 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
         del1 = del2;
         if (c1 < cm || c1 >= betmx + dc) {
             iret = -1;
+            tr.c_end  = c1;
+            tr.reason = (c1 < cm) ? GetsolTrace::BELOW_CM : GetsolTrace::PASSED_BETMX;
             return;
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Failure report helpers                                               */
+/* ------------------------------------------------------------------ */
+
+/* Scan the period equation on a fine grid and list its sign changes, to
+ * tell apart "no root exists below betmx" from "a root exists but the
+ * dc-stepping missed it or searched in the wrong direction". */
+static std::string scan_period_equation(double t, int ifunc, double cmin, double cmax,
+                                        double dc,
+                                        float *d, float *a, float *b, float *rho,
+                                        float *rtp, float *dtp, float *btp,
+                                        int mmax, int llw, double betmx)
+{
+    std::ostringstream os;
+    if (!(std::isfinite(cmin) && std::isfinite(cmax)) || cmax <= cmin || cmin <= 0.0) {
+        os << "    scan skipped: invalid range [" << cmin << ", " << cmax << "]\n";
+        return os.str();
+    }
+    const int max_eval = 20000;
+    double step = 0.25 * dc;
+    if ((cmax - cmin) / step > max_eval) step = (cmax - cmin) / max_eval;
+
+    const double omega = TWOPI / t;
+    int n_change = 0, n_below_betmx = 0, n_nonfinite = 0;
+    std::ostringstream roots;
+    double c_prev = cmin;
+    double f_prev = dltar(omega / c_prev, omega, ifunc, d, a, b, rho, rtp, dtp, btp, mmax, llw);
+    if (!std::isfinite(f_prev)) ++n_nonfinite;
+    for (double c = cmin + step; c <= cmax + 0.5 * step; c += step) {
+        double f = dltar(omega / c, omega, ifunc, d, a, b, rho, rtp, dtp, btp, mmax, llw);
+        if (!std::isfinite(f)) { ++n_nonfinite; c_prev = c; f_prev = f; continue; }
+        if (std::isfinite(f_prev) && std::copysign(1.0, f) != std::copysign(1.0, f_prev)) {
+            ++n_change;
+            if (0.5 * (c + c_prev) <= betmx) ++n_below_betmx;
+            if (n_change <= 8) roots << " " << 0.5 * (c + c_prev);
+        }
+        c_prev = c;
+        f_prev = f;
+    }
+    os << "    scan of period equation, c in [" << cmin << ", " << cmax << "] step " << step
+       << ": " << n_change << " sign change(s), " << n_below_betmx << " at c <= betmx";
+    if (n_nonfinite > 0) os << ", " << n_nonfinite << " NON-FINITE value(s)";
+    os << "\n";
+    if (n_change > 0) os << "      sign changes near c =" << roots.str()
+                         << (n_change > 8 ? " ..." : "") << "\n";
+    return os.str();
+}
+
+/* Sanity checks and a dump of the (unflattened) input model. */
+static std::string describe_model(const float *thkm, const float *vpm, const float *vsm,
+                                  const float *rhom, int nlayer, bool with_table)
+{
+    std::ostringstream os;
+    int n_nonfinite = 0, n_vs_neg = 0, n_vs_zero_below_top = 0, n_vp_nonpos = 0,
+        n_rho_nonpos = 0, n_vp_le_vs = 0;
+    double vpvs_min = 1.0e30;
+    int    vpvs_min_layer = -1;
+    int    jmax = -1;
+    for (int i = 0; i < nlayer; i++) {
+        if (!std::isfinite(thkm[i]) || !std::isfinite(vpm[i]) ||
+            !std::isfinite(vsm[i])  || !std::isfinite(rhom[i])) {
+            ++n_nonfinite;
+            continue;
+        }
+        if (vsm[i] < 0.0f) ++n_vs_neg;
+        if (vsm[i] == 0.0f && i > 0) ++n_vs_zero_below_top;
+        if (vpm[i] <= 0.0f) ++n_vp_nonpos;
+        if (rhom[i] <= 0.0f) ++n_rho_nonpos;
+        if (vsm[i] > 0.0f) {
+            if (vpm[i] <= vsm[i]) ++n_vp_le_vs;
+            double r = (double)vpm[i] / (double)vsm[i];
+            if (r < vpvs_min) { vpvs_min = r; vpvs_min_layer = i; }
+        }
+        if (jmax < 0 || vsm[i] > vsm[jmax]) jmax = i;
+    }
+    const int ih = nlayer - 1;
+    os << "    model checks: non-finite layers=" << n_nonfinite
+       << ", vs<0: " << n_vs_neg
+       << ", vs==0 below top: " << n_vs_zero_below_top
+       << ", vp<=0: " << n_vp_nonpos
+       << ", rho<=0: " << n_rho_nonpos
+       << ", vp<=vs: " << n_vp_le_vs;
+    if (vpvs_min_layer >= 0)
+        os << ", min vp/vs=" << vpvs_min << " (layer " << vpvs_min_layer << ")";
+    os << "\n";
+    os << "    halfspace (layer " << ih << ") vs=" << vsm[ih];
+    if (jmax >= 0) {
+        os << "; max vs=" << vsm[jmax] << " at layer " << jmax;
+        if (vsm[ih] < vsm[jmax])
+            os << "  <-- halfspace is SLOWER than an overlying layer "
+                  "(fundamental mode can exceed halfspace Vs at long periods)";
+    }
+    os << "\n";
+
+    if (with_table) {
+        os << "    input model (before earth flattening):\n"
+           << "      layer   top_km    thk_km      vp      vs     rho\n";
+        double z = 0.0;
+        char line[160];
+        for (int i = 0; i < nlayer; i++) {
+            snprintf(line, sizeof(line), "      %5d %8.3f %9.4f %7.4f %7.4f %7.4f\n",
+                     i, z, (double)thkm[i], (double)vpm[i], (double)vsm[i], (double)rhom[i]);
+            os << line;
+            z += (double)thkm[i];
+        }
+    }
+    return os.str();
 }
 
 /* ================================================================== */
@@ -625,6 +823,31 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
     int idispl = 0, idispr = 0;
     if (iwave == 1) idispl = kmax;
     else            idispr = kmax;
+
+    const char *wave_name = (iwave == 1) ? "Love" : "Rayleigh";
+
+    /* Non-finite values, negative/zero Vs below the top layer, or
+     * non-positive Vp/rho make the root search fail or loop forever.
+     * Report them explicitly instead. */
+    {
+        bool bad = false;
+        for (int i = 0; i < mmax && !bad; i++) {
+            bad = !std::isfinite(thkm[i]) || !std::isfinite(vpm[i]) ||
+                  !std::isfinite(vsm[i])  || !std::isfinite(rhom[i]) ||
+                  vsm[i] < 0.0f || (vsm[i] == 0.0f && i > 0) ||
+                  vpm[i] <= 0.0f || rhom[i] <= 0.0f || vpm[i] <= vsm[i];
+        }
+        if (bad) {
+            std::ostringstream os;
+            os << "WARNING: improper initial value in disper - no zero found in fundamental mode\n"
+               << "  disper: INVALID INPUT MODEL (" << wave_name << ", igr=" << igr
+               << ", nlayer=" << nlayer << ", kmax=" << kmax << "); returning zeros for all periods\n"
+               << describe_model(thkm, vpm, vsm, rhom, nlayer, true);
+            record_failure(std::string("WARNING: disper: invalid input model (") + wave_name +
+                           "), returning zeros", os.str());
+            return cg;
+        }
+    }
 
     /* Phase velocity search increment */
     float min_vs = *std::min_element(vsm, vsm + nlayer);
@@ -693,6 +916,62 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
         int ift = 999;
         double del1st = 0.0;   /* saved state for getsol direction logic */
 
+        GetsolTrace trace;
+
+        /* Build and record a report for a fundamental-mode failure at period k. */
+        auto report_failure = [&](int k, double t_search, const char *what) {
+            std::ostringstream os;
+            os << "WARNING: improper initial value in disper - no zero found in fundamental mode\n"
+               << "  disper failure: " << wave_name << (igr > 0 ? " group" : " phase")
+               << " (igr=" << igr << "), mode " << mode
+               << ", " << (nsph == 1 ? "spherical" : "flat") << " earth"
+               << ", nlayer=" << nlayer << ", kmax=" << kmax
+               << (llw != 1 ? ", water layer on top" : "") << "\n"
+               << "  failed at period index k=" << k << " of " << kmax
+               << ": T=" << t[k] << " s (searched at T=" << t_search << " s)\n";
+            if (k > 0) {
+                os << "  phase velocities at earlier periods (km/s):";
+                for (int i = 0; i < k; i++) os << " " << c[i];
+                os << "\n";
+            } else {
+                os << "  failed at the FIRST period: the search from the starting value found no root\n";
+            }
+            os << "  " << what << "\n"
+               << "  getsol: " << getsol_reason_str(trace.reason)
+               << "; start c=" << trace.c_start
+               << (k == 0 ? " (= cm)" : " (= previous c - 1.5*dc)")
+               << ", period equation at start=" << trace.del_start
+               << ", initial direction=" << (trace.idir > 0 ? "up" : "down")
+               << ", steps=" << trace.nstep
+               << ", last c=" << trace.c_end << "\n"
+               << "  search parameters (flattened model): cm=" << cm_val
+               << " (0.855 x " << (jsol == 0 ? "Vp" : "halfspace Rayleigh velocity")
+               << " of slowest layer " << jmn << "), dc=" << dc
+               << ", betmn=" << betmn << ", betmx=" << betmx
+               << ", flattened halfspace vs=" << b[mmax - 1] << "\n"
+               << scan_period_equation(t_search, ifunc, 0.9 * cm_val, 1.1 * (double)betmx, dc,
+                                       d.data(), a.data(), b.data(), rho.data(),
+                                       rtp.data(), dtp.data(), btp.data(),
+                                       mmax, llw, (double)betmx)
+               << describe_model(thkm, vpm, vsm, rhom, nlayer, true);
+
+            std::ostringstream summary;
+            summary << "WARNING: disper: no fundamental-mode zero (" << wave_name
+                    << ", igr=" << igr << ") at T=" << t[k] << " s (k=" << k << "/" << kmax
+                    << "): " << getsol_reason_str(trace.reason)
+                    << "; betmx=" << betmx << ", last c=" << trace.c_end;
+            record_failure(summary.str(), os.str());
+        };
+
+        if (!std::isfinite(cc) || cc <= 0.0) {
+            trace = GetsolTrace();
+            trace.c_start = trace.c_end = cc;
+            report_failure(0, t[0], "non-finite or non-positive starting velocity from gtsolh "
+                                    "(check vp/vs of the slowest layer)");
+            for (int i = 0; i < kmax; i++) cg[i] = 0.0;
+            return cg;
+        }
+
         for (int iq = 1; iq <= mode; iq++) {
             int is = 0;
             int ie = kmax - 1;
@@ -710,9 +989,8 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
                     } else {
                         if (iverb[ifunc - 1] == 0) {
                             iverb[ifunc - 1] = 1;
-                            fprintf(stderr,
-                                "WARNING: improper initial value in disper "
-                                "- no zero found in fundamental mode\n");
+                            trace = GetsolTrace();
+                            report_failure(k, t[k], "fundamental mode marked as failed at an earlier period");
                         }
                         for (int i = k; i <= ie; i++) cg[i] = 0.0;
                         return cg;
@@ -759,7 +1037,7 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
                        iret, ifunc, ifirst,
                        d.data(), a.data(), b.data(), rho.data(),
                        rtp.data(), dtp.data(), btp.data(),
-                       mmax, llw, del1st);
+                       mmax, llw, del1st, &trace);
 
                 if (iret == -1) {
                     if (iq > 1) {
@@ -768,9 +1046,7 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
                     } else {
                         if (iverb[ifunc - 1] == 0) {
                             iverb[ifunc - 1] = 1;
-                            fprintf(stderr,
-                                "WARNING: improper initial value in disper "
-                                "- no zero found in fundamental mode\n");
+                            report_failure(k, t1, "root search (getsol) failed");
                         }
                         for (int i = k; i <= ie; i++) cg[i] = 0.0;
                         return cg;

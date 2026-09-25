@@ -81,7 +81,16 @@ Eigen::VectorX<real_t> Inversion1D::inv1d(
                 IFLSPH, iwave_of(wt), IMODE, itype
             );
 
+            surfker::reset_disper_diag();
             Eigen::VectorX<real_t> pred_vel = surfker::surfdisp(req);
+            if (surfker::disper_fail_count() > 0) {
+                logger.Warn(fmt::format(
+                    "1D inversion iter {}: dispersion calculation failed for {}_{} "
+                    "(Vs range [{:.4f}, {:.4f}] km/s)\n{}",
+                    iter, waveTypeStr[static_cast<int>(wt)], (itype == 0 ? "PH" : "GR"),
+                    vs1d.minCoeff(), vs1d.maxCoeff(), surfker::disper_fail_report()),
+                    MODULE_INV1D);
+            }
             real_t misfit = 0.5 * (pred_vel - sr.periods_info.meanvel).array().square().sum();
             logger.Debug(
                 fmt::format("  iter {:3d} | {}_{} misfit={:.6e} (weight={:.3f})",

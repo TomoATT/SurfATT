@@ -109,6 +109,9 @@ constexpr real_t MAX_SD_ANGLE = 120; // maximum allowable descent angle for stee
 // global variables
 // ---------------------------------------------------------------------------
 inline int run_mode = INVERSION_MODE;
+// Current stage (e.g. "iter 12 line-search trial 1 alpha=..."), attached to
+// diagnostics such as dispersion-solver failure dumps.
+inline std::string diag_context = "init";
 
 // ---------------------------------------------------------------------------
 // module names

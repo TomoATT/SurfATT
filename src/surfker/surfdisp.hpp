@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <stdexcept>
+#include <string>
 #include "config.h"
 
 constexpr double TWOPI = 2.0 * PI;
@@ -34,6 +35,13 @@ struct LoveGroupKernelResult : LoveEigenResult {
 std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm,
                              const float *rhom, int nlayer, int iflsph, int iwave,
                              int mode, int igr, int kmax, const double *t);
+
+// Diagnostics of fundamental-mode failures in disper() (per thread).
+// disper() writes a rate-limited report to stderr on every failure; callers
+// that want to attach context can reset, run, then query.
+void disper_diag_reset();
+int disper_diag_nfail();                    // failures since the last reset
+const std::string &disper_diag_report();    // full report of the first one
 
 // Love-wave eigenfunctions + phase-velocity kernels at one period.
 // phase_vel_km_s: phase velocity at period_s (from surfdisp::dispersion)

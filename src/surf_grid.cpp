@@ -1,10 +1,86 @@
 #include "surf_grid.h"
 
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+
 namespace {
 
 inline int kernel_idx4(const int ix, const int iy, const int iz, const int iper,
                        const int ngrid_j, const int ngrid_k, const int nperiod_) {
     return (((ix * ngrid_j) + iy) * ngrid_k + iz) * nperiod_ + iper;
+}
+
+// Per-rank limits on dispersion-failure output.
+constexpr int MAX_DISPER_DUMPS = 5;     // dump files
+constexpr int MAX_DISPER_LINES = 50;    // one-line stderr messages
+
+// Record a surface grid point whose 1-D dispersion calculation failed
+// ("no zero found in fundamental mode", or non-finite results). The dump file
+// holds the 1-D profile, periods and solver report, which is enough to
+// reproduce the failure offline without the travel-time data.
+void report_disper_failure(const std::string &where, const std::string &type_name,
+                           int ix_glob, int iy_glob,
+                           const Eigen::VectorX<real_t> &vs1d,
+                           const Eigen::VectorX<real_t> &vp1d,
+                           const Eigen::VectorX<real_t> &rho1d,
+                           const Eigen::VectorX<real_t> &periods,
+                           const Eigen::VectorX<real_t> *result,
+                           const std::string &detail) {
+    static int ndump = 0, nline = 0;
+    auto &mpi = Parallel::mpi();
+    auto &mg = ModelGrid::MG();
+    auto &IP = InputParams::IP();
+
+    const std::string loc = fmt::format("ix={} iy={} lon={:.4f} lat={:.4f}",
+        ix_glob, iy_glob, mg.xgrids(ix_glob), mg.ygrids(iy_glob));
+
+    std::string fname = "(dump limit reached)";
+    if (ndump < MAX_DISPER_DUMPS) {
+        fname = fmt::format("{}/disper_fail_{}_rank{:04d}_{:02d}.txt",
+            IP.output().output_path, type_name, mpi.rank(), ndump++);
+        std::ofstream f(fname);
+        if (f) {
+            f << "# SurfATT dispersion failure dump\n"
+              << "# stage: " << diag_context << "\n"
+              << "# where: " << where << " " << type_name << "\n"
+              << "# location: " << loc << "\n"
+              << fmt::format("# settings: iflsph={} imode={} use_alpha_beta_rho={} model_para_type={}\n",
+                     IFLSPH, IMODE, IP.inversion().use_alpha_beta_rho, IP.inversion().model_para_type);
+            f << "# periods_s:";
+            for (int i = 0; i < periods.size(); ++i) f << fmt::format(" {:.8g}", periods(i));
+            f << "\n";
+            if (result) {
+                f << "# output_km_s:";
+                for (int i = 0; i < result->size(); ++i) f << fmt::format(" {:.8g}", (*result)(i));
+                f << "\n";
+            }
+            f << "# 1-D profile at the depth nodes (the halfspace is a copy of the last node)\n"
+              << "# depth_km vs_km_s vp_km_s rho_g_cm3\n";
+            for (int k = 0; k < vs1d.size(); ++k)
+                f << fmt::format("{:.8g} {:.8g} {:.8g} {:.8g}\n",
+                                 mg.zgrids(k), vs1d(k), vp1d(k), rho1d(k));
+            if (!detail.empty()) {
+                f << "# ---- solver report ----\n";
+                std::istringstream is(detail);
+                for (std::string line; std::getline(is, line);) f << "# " << line << "\n";
+            }
+        } else {
+            fname = "(could not open " + fname + ")";
+        }
+    }
+    if (nline < MAX_DISPER_LINES) {
+        ++nline;
+        std::fprintf(stderr, "WARNING: [rank %d] %s %s: dispersion failure at %s, stage '%s', dump: %s\n",
+                     mpi.rank(), where.c_str(), type_name.c_str(), loc.c_str(),
+                     diag_context.c_str(), fname.c_str());
+        std::fflush(stderr);
+    }
+}
+
+// Non-finite or non-positive velocities returned for a grid point.
+bool bad_velocities(const Eigen::VectorX<real_t> &v) {
+    return !v.allFinite() || (v.array() <= _0_CR).any();
 }
 
 }
@@ -113,7 +189,14 @@ void SurfGrid::build_media_matrix_with_topo() {
         auto req = surfker::build_disp_req(mg.zgrids, mg.vs1d, periods,
                                 IFLSPH, iwave_of(wt_), IMODE, itype_);
 
+        surfker::reset_disper_diag();
         avg_svel = surfker::surfdisp(req);
+        if (surfker::disper_fail_count() > 0 || bad_velocities(avg_svel)) {
+            ATTLogger::logger().Warn(fmt::format(
+                "Dispersion of the averaged 1-D model (used for the topography smoothing "
+                "length) failed for {}.\n{}",
+                type_name(), surfker::disper_fail_report()), MODULE_GRID);
+        }
     }
     mpi.barrier();
     mpi.bcast(avg_svel.data(), nperiod_);
@@ -224,6 +307,21 @@ void SurfGrid::fwdsurf(){
 
     const int n_elem = ngrid_i * ngrid_j * nperiod_;
     std::vector<real_t> tmp_svel(n_elem, _0_CR);
+
+    // Diagnostics. A fundamental-mode phase velocity reaching the Vs of the
+    // halfspace (last depth node, earth-flattened) means the trapped mode is
+    // about to disappear, which is when the solver stops finding a root.
+    int n_fail_local = 0;
+    int n_above_half_local = 0;
+    real_t max_ratio_local = _0_CR;
+    const bool is_phase = (itype_ == static_cast<int>(SurfType::PH));
+    real_t flat_factor = _1_CR;
+    if (IFLSPH == 1 && ngrid_k > 1) {
+        const real_t z_half = mg.zgrids(ngrid_k - 1) - mg.zgrids(0)
+                            + (mg.zgrids(ngrid_k - 1) - mg.zgrids(ngrid_k - 2));
+        flat_factor = 6370.0 / (6370.0 - z_half);
+    }
+
     for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
         for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
             const int ix_glob = dcp.loc_I_start() + ix;
@@ -247,7 +345,18 @@ void SurfGrid::fwdsurf(){
             }
             auto req = surfker::build_disp_req(mg.zgrids, vs1d, vp1d, rho1d, periods,
                                         IFLSPH, iwave_of(wt_), IMODE, itype_);
+            surfker::reset_disper_diag();
             Eigen::VectorX<real_t> svel_point = surfker::surfdisp(req);
+            if (surfker::disper_fail_count() > 0 || bad_velocities(svel_point)) {
+                ++n_fail_local;
+                report_disper_failure("fwdsurf", type_name(), ix_glob, iy_glob,
+                                      vs1d, vp1d, rho1d, periods, &svel_point,
+                                      surfker::disper_fail_report());
+            } else if (is_phase) {
+                const real_t ratio = svel_point.maxCoeff() / (vs1d(ngrid_k - 1) * flat_factor);
+                max_ratio_local = std::max(max_ratio_local, ratio);
+                if (ratio >= _1_CR) ++n_above_half_local;
+            }
             for (int iper = 0; iper < nperiod_; ++iper) {
                 const int idx = surf_idx(ix_glob, iy_glob, iper);
                 tmp_svel[idx] = svel_point(iper);
@@ -261,6 +370,24 @@ void SurfGrid::fwdsurf(){
     mpi.sum_all_all_vect_inplace(tmp_svel);
     if (mpi.is_node_main()) {
         std::copy(tmp_svel.begin(), tmp_svel.end(), svel);
+    }
+
+    int n_fail = 0, n_above_half = 0;
+    real_t max_ratio = _0_CR;
+    mpi.sum_all_all(n_fail_local, n_fail);
+    mpi.sum_all_all(n_above_half_local, n_above_half);
+    mpi.max_all_all(max_ratio_local, max_ratio);
+    if (is_phase) {
+        logger.Info(fmt::format(
+            "{}: max over grid of c/Vs_halfspace = {:.4f}; grid points with c >= Vs_halfspace: {}",
+            type_name(), max_ratio, n_above_half), MODULE_GRID);
+    }
+    if (n_fail > 0) {
+        logger.Warn(fmt::format(
+            "{}: dispersion calculation failed at {} of {} surface grid points (stage: {}). "
+            "Velocities there are 0. See stderr and {}/disper_fail_{}_rank*.txt",
+            type_name(), n_fail, ngrid_i * ngrid_j, diag_context,
+            IP.output().output_path, type_name()), MODULE_GRID);
     }
     mpi.barrier();
 }
@@ -282,6 +409,7 @@ void SurfGrid::compute_dispersion_kernel() {
 
     using MatRM = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
+    int n_fail_local = 0;
     for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
         for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
             Eigen::VectorX<real_t> vs1d(ngrid_k);
@@ -305,12 +433,29 @@ void SurfGrid::compute_dispersion_kernel() {
             auto req = surfker::build_disp_req(mg.zgrids, vs1d, vp1d, rho1d, periods,
                                     IFLSPH, iwave_of(wt_), IMODE, itype_);
             surfker::DepthKernel1D kernels;
+            surfker::reset_disper_diag();
             if (IP.inversion().model_para_type != MODEL_AZI_ANI) {
                 kernels = surfker::depthkernel1d(req);
             } else {
                 kernels = surfker::depthkernelHTI1d(req);
             }
-            
+
+            // A failed phase-velocity search leaves cp = 0 and non-finite
+            // kernels, which turn into NaN gradients and a NaN model.
+            const bool kernels_finite =
+                kernels.sen_vs.allFinite() && kernels.sen_vp.allFinite() &&
+                kernels.sen_rho.allFinite() && kernels.sen_gc.allFinite() &&
+                kernels.sen_gs.allFinite();
+            if (surfker::disper_fail_count() > 0 || !kernels_finite) {
+                ++n_fail_local;
+                const std::string detail = surfker::disper_fail_count() > 0
+                    ? surfker::disper_fail_report()
+                    : std::string("dispersion solved, but the depth kernels contain non-finite values");
+                report_disper_failure("kernel", type_name(),
+                                      dcp.loc_I_start() + ix, dcp.loc_J_start() + iy,
+                                      vs1d, vp1d, rho1d, periods, nullptr, detail);
+            }
+
             // Copy the kernels for this grid point into the corresponding location in the global sensitivity arrays.
             const int id0 = kernel_idx4(ix, iy, 0, 0, dcp.loc_ny(), ngrid_k, nperiod_);
             Eigen::Map<MatRM> vs_block(sen_vs_loc.data() + id0, ngrid_k, nperiod_);
@@ -328,6 +473,16 @@ void SurfGrid::compute_dispersion_kernel() {
                 gs_block = kernels.sen_gs.transpose();
             }
         }
+    }
+
+    int n_fail = 0;
+    mpi.sum_all_all(n_fail_local, n_fail);
+    if (n_fail > 0) {
+        logger.Warn(fmt::format(
+            "{}: depth-kernel calculation failed at {} of {} surface grid points (stage: {}). "
+            "See stderr and {}/disper_fail_{}_rank*.txt",
+            type_name(), n_fail, ngrid_i * ngrid_j, diag_context,
+            IP.output().output_path, type_name()), MODULE_GRID);
     }
     mpi.barrier();
 }

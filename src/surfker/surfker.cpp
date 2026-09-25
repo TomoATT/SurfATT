@@ -80,6 +80,10 @@ surfker::DispersionRequest refine_request(
 
 namespace surfker {
 
+void reset_disper_diag() { disper_diag_reset(); }
+int disper_fail_count() { return disper_diag_nfail(); }
+const std::string &disper_fail_report() { return disper_diag_report(); }
+
 DispersionRequest build_disp_req(const Eigen::VectorX<real_t>& dep,
                                 const Eigen::VectorX<real_t>& vs,
                                 const Eigen::VectorX<real_t>& periods_s,
