@@ -564,7 +564,19 @@ static void getsol(double t1, double &c1, double clow, double dc, double cm,
     else
         idir = -1;
 
-    while (true) {
+    /* A non-finite model makes every exit test below compare false, so the
+     * search would never end. Cap the number of steps well above what a
+     * healthy search needs and report a failure instead. */
+    long max_steps = 1000000;
+    if (std::isfinite(betmx) && dc > 0.0)
+        max_steps = std::min(max_steps, 10L * (long)((betmx + dc) / dc) + 1000L);
+
+    for (long nstep = 0; ; ++nstep) {
+        if (nstep >= max_steps) {
+            iret = -1;
+            return;
+        }
+
         double c2;
         if (idir > 0)
             c2 = c1 + dc;
@@ -690,7 +702,10 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
 
         for (int i = 0; i < kmax; i++) { c[i] = 0.0;  cb[i] = 0.0; }
 
-        int ift = 999;
+        /* First period index at which a lower mode failed; kmax = none yet.
+         * (Fortran used 999, which aborts the fundamental mode at k=999
+         * whenever kmax >= 1000.) */
+        int ift = kmax;
         double del1st = 0.0;   /* saved state for getsol direction logic */
 
         for (int iq = 1; iq <= mode; iq++) {

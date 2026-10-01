@@ -54,6 +54,7 @@ __pycache__/
 
 # Output files produced by the program
 OUTPUT_FILES/
+figures/
 
 tests/*/*.png
 tests/*/*.h5

@@ -1,10 +1,64 @@
 #include "surf_grid.h"
 
+#include <fstream>
+
 namespace {
 
 inline int kernel_idx4(const int ix, const int iy, const int iz, const int iper,
                        const int ngrid_j, const int ngrid_k, const int nperiod_) {
     return (((ix * ngrid_j) + iy) * ngrid_k + iz) * nperiod_ + iper;
+}
+
+// Grid points on this rank where the dispersion solver failed; the 1-D model
+// of the first one is kept so that the failure can be reproduced offline.
+struct DisperFailure {
+    int count = 0;
+    int ix = -1, iy = -1;
+    Eigen::VectorX<real_t> vs, vp, rho;
+
+    void add(int ix_glob, int iy_glob, const Eigen::VectorX<real_t> &vs1d,
+             const Eigen::VectorX<real_t> &vp1d, const Eigen::VectorX<real_t> &rho1d) {
+        if (count++ > 0) return;
+        ix = ix_glob; iy = iy_glob;
+        vs = vs1d; vp = vp1d; rho = rho1d;
+    }
+};
+
+// Collective. disper() returns 0 from the first period without a
+// fundamental-mode root; such velocities must not reach the eikonal solver,
+// and non-finite kernels would turn the model into NaN. If any rank failed, write the
+// first failed 1-D model of each rank to
+// <output_path>/disper_fail_<type>_rank<N>.txt and abort all ranks.
+void abort_on_disper_failure(const DisperFailure &fail, const std::string &what,
+                             const std::string &type_name,
+                             const Eigen::VectorX<real_t> &periods) {
+    auto &mpi = Parallel::mpi();
+    int n_fail = 0;
+    mpi.sum_all_all(fail.count, n_fail);
+    if (n_fail == 0) return;
+
+    auto &mg = ModelGrid::MG();
+    const std::string &out_dir = InputParams::IP().output().output_path;
+    if (fail.count > 0) {
+        std::ofstream f(fmt::format("{}/disper_fail_{}_rank{:04d}.txt", out_dir, type_name, mpi.rank()));
+        f << fmt::format("# {} {}: {} grid point(s) failed on this rank, first one at "
+                         "ix={} iy={} (x={:.4f} y={:.4f})\n",
+                         type_name, what, fail.count, fail.ix, fail.iy,
+                         mg.xgrids(fail.ix), mg.ygrids(fail.iy));
+        f << "# periods_s:";
+        for (int i = 0; i < periods.size(); ++i) f << fmt::format(" {:.8g}", periods(i));
+        f << "\n# depth_km vs_km_s vp_km_s rho_g_cm3\n";
+        for (int k = 0; k < fail.vs.size(); ++k)
+            f << fmt::format("{:.8g} {:.8g} {:.8g} {:.8g}\n",
+                             mg.zgrids(k), fail.vs(k), fail.vp(k), fail.rho(k));
+    }
+    ATTLogger::logger().Error(fmt::format(
+        "{}: {} at {} of {} surface grid points. 1-D models of the failed points "
+        "are written to {}/disper_fail_{}_rank*.txt",
+        type_name, what, n_fail, ngrid_i * ngrid_j, out_dir, type_name), MODULE_GRID);
+    // Let rank 0 flush its log before any rank's MPI_Abort tears the job down.
+    mpi.barrier();
+    mpi.abort(EXIT_FAILURE);
 }
 
 }
@@ -224,6 +278,7 @@ void SurfGrid::fwdsurf(){
 
     const int n_elem = ngrid_i * ngrid_j * nperiod_;
     std::vector<real_t> tmp_svel(n_elem, _0_CR);
+    DisperFailure fail;
     for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
         for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
             const int ix_glob = dcp.loc_I_start() + ix;
@@ -248,12 +303,17 @@ void SurfGrid::fwdsurf(){
             auto req = surfker::build_disp_req(mg.zgrids, vs1d, vp1d, rho1d, periods,
                                         IFLSPH, iwave_of(wt_), IMODE, itype_);
             Eigen::VectorX<real_t> svel_point = surfker::surfdisp(req);
+            if (!svel_point.allFinite() || (svel_point.array() <= _0_CR).any()) {
+                fail.add(ix_glob, iy_glob, vs1d, vp1d, rho1d);
+            }
             for (int iper = 0; iper < nperiod_; ++iper) {
                 const int idx = surf_idx(ix_glob, iy_glob, iper);
                 tmp_svel[idx] = svel_point(iper);
             }
         }
     }
+    abort_on_disper_failure(fail, "dispersion solver failed (zero or non-finite velocity)",
+                            type_name(), periods);
     // Reduce into a private buffer first to avoid the shared-memory double-write
     // problem: svel is MPI shared memory; all node-local ranks point to the same
     // physical address, so MPI_Allreduce writing directly to svel would accumulate
@@ -282,6 +342,7 @@ void SurfGrid::compute_dispersion_kernel() {
 
     using MatRM = Eigen::Matrix<real_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
+    DisperFailure fail;
     for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
         for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
             Eigen::VectorX<real_t> vs1d(ngrid_k);
@@ -310,7 +371,13 @@ void SurfGrid::compute_dispersion_kernel() {
             } else {
                 kernels = surfker::depthkernelHTI1d(req);
             }
-            
+            // Empty matrices (e.g. sen_vp for Love waves) pass trivially.
+            if (!kernels.sen_vs.allFinite() || !kernels.sen_vp.allFinite() ||
+                !kernels.sen_rho.allFinite() || !kernels.sen_gc.allFinite() ||
+                !kernels.sen_gs.allFinite()) {
+                fail.add(dcp.loc_I_start() + ix, dcp.loc_J_start() + iy, vs1d, vp1d, rho1d);
+            }
+
             // Copy the kernels for this grid point into the corresponding location in the global sensitivity arrays.
             const int id0 = kernel_idx4(ix, iy, 0, 0, dcp.loc_ny(), ngrid_k, nperiod_);
             Eigen::Map<MatRM> vs_block(sen_vs_loc.data() + id0, ngrid_k, nperiod_);
@@ -329,6 +396,10 @@ void SurfGrid::compute_dispersion_kernel() {
             }
         }
     }
+    // Group kernels re-run disper() at periods perturbed by +-0.5%, which can
+    // fail even where fwdsurf() succeeded.
+    abort_on_disper_failure(fail, "depth kernels are non-finite (dispersion solver failed)",
+                            type_name(), periods);
     mpi.barrier();
 }
 

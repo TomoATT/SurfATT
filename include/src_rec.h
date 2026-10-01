@@ -72,7 +72,13 @@ public:
     // Rank 0 reads the file; each field gets its own per-node MPI shared-memory
     // window via Parallel::alloc_shared (1-D for numeric, 2-D for strings).
     // Must call release_shm() before MPI_Finalize().
-    void load(const std::string& filepath);
+    // The period column is always validated (finite, > 0); with check_obs the
+    // observed tt and vel columns are too. Aborts all ranks on invalid rows.
+    void load(const std::string& filepath, bool check_obs = false);
+
+    // Log an error listing rows whose value in `col` is non-finite or <= 0.
+    // Returns the number of such rows (0 = column is valid).
+    int check_positive(const real_t* col, const std::string& col_name) const;
 
     // gather synthetic travel times
     void gather_syn_tt();
@@ -134,6 +140,7 @@ private:
 
     void get_events();
     void get_periods();
+    std::string filepath_;  // CSV path, for diagnostics
     int nsrc_total_ = 0;
     // Number of rows after load()
     int n_obs_ = 0;

@@ -94,6 +94,9 @@ public:
     std::vector<T> read_vector(const std::string &name) const {
         H5::DataSet   ds = file_.openDataSet(name);
         H5::DataSpace sp = ds.getSpace();
+        if (sp.getSimpleExtentNdims() != 1)
+            throw std::runtime_error(
+                "H5IO::read_vector: dataset '" + name + "' is not 1-D");
         hsize_t n = 0;
         sp.getSimpleExtentDims(&n, nullptr);
         std::vector<T> v(n);
