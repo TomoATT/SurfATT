@@ -34,9 +34,10 @@ int main(int argc, char* argv[])
         false
     );
 
-    // load source-receiver tables into shared memory
+    // load source-receiver tables into shared memory; tt/vel are observations
+    // (and so validated) only when inverting
     for (auto [wt, vt] : IP.data().active_data)
-        SrcRec::SR(wt, vt).load(IP.data().file_of(wt, vt));
+        SrcRec::SR(wt, vt).load(IP.data().file_of(wt, vt), run_mode == INVERSION_MODE);
     SrcRec::build_stas();
 
     // build model grid
