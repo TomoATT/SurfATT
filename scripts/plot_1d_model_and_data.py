@@ -12,9 +12,10 @@ engine as SURFATT_tomo (same layering, Earth flattening, fundamental mode and
 empirical Vp/rho relations). Build it with:
     cd build && cmake .. && make -j SURFATT_kernel1d
 
-Place this script in the project folder (the parent of OUTPUT_FILES), edit the
-parameters below and run:
-    python plot_1d_model_and_data.py
+Edit the parameters below and run it from the project folder (the parent of
+OUTPUT_FILES), e.g.:
+    cd examples/00_checkerboard_iso
+    python ../../scripts/plot_1d_model_and_data.py
 
 Requirements: numpy, pandas, h5py, matplotlib
 """
@@ -33,8 +34,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # =============================================================================
-# User parameters (paths are relative to the folder containing this script)
+# User parameters (relative paths are relative to the current working directory)
 # =============================================================================
 OUTPUT_DIR = "OUTPUT_FILES"
 INITIAL_MODEL = os.path.join(OUTPUT_DIR, "initial_model.h5")
@@ -56,8 +59,9 @@ SRC_REC_FILES = {
 # None uses all grid points (including the margin grid).
 REGION = None
 
-# Path to the kernel tool; if not found, SURFATT_kernel1d is searched in PATH
-KERNEL_BIN = "../../bin/SURFATT_kernel1d"
+# Path to the kernel tool (default: bin/ of this repository); if not found,
+# SURFATT_kernel1d is searched in PATH
+KERNEL_BIN = os.path.join(SCRIPT_DIR, "..", "bin", "SURFATT_kernel1d")
 # Launcher prefix, e.g. ["mpirun", "-np", "1"] if the bare MPI binary fails
 MPI_LAUNCHER = []
 
@@ -110,11 +114,11 @@ plt.rcParams.update({
     "legend.frameon": False,
 })
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.getcwd()
 
 
 def resolve(path):
-    """Return an absolute path, interpreting relative paths from BASE_DIR."""
+    """Return an absolute path, interpreting relative paths from the working directory."""
     return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
 
 
