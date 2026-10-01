@@ -690,7 +690,10 @@ std::vector<double> disper(const float *thkm, const float *vpm, const float *vsm
 
         for (int i = 0; i < kmax; i++) { c[i] = 0.0;  cb[i] = 0.0; }
 
-        int ift = 999;
+        /* First period index at which a lower mode failed; kmax = none yet.
+         * (Fortran used 999, which aborts the fundamental mode at k=999
+         * whenever kmax >= 1000.) */
+        int ift = kmax;
         double del1st = 0.0;   /* saved state for getsol direction logic */
 
         for (int iq = 1; iq <= mode; iq++) {
