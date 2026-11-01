@@ -262,13 +262,13 @@ void preproc::combine_kernels(SurfGrid& sg) {
                     const real_t r2 = IP.inversion().model_para_type == MODEL_AZI_ANI ? sg.r2_loc(ix, iy, iper) : _0_CR;
                     const real_t scale = _1_CR / std::sqrt(_1_CR + r1*r1 + r2*r2);
                     for (int k = 0; k < ngrid_k; ++k) {
-                        sg.ker_loc[0](ix, iy, k) -= att * scale * sg.sen_vs_loc(ix, iy, k, iper);
-                        sg.ker_loc[1](ix, iy, k) -= att * scale * sg.sen_vp_loc(ix, iy, k, iper);
+                        sg.ker_loc[0](ix, iy, k) -= att * mg.vs3d_loc(ix, iy, k) * scale * sg.sen_vs_loc(ix, iy, k, iper);
+                        sg.ker_loc[1](ix, iy, k) -= att * mg.vp3d_loc(ix, iy, k) * scale * sg.sen_vp_loc(ix, iy, k, iper);
                         if (IP.postproc().is_kden) {
-                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * scale * sg.sen_vs_loc(ix, iy, k, iper);
+                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * mg.vs3d_loc(ix, iy, k) * scale * sg.sen_vs_loc(ix, iy, k, iper);
                         }
                         if (!IP.inversion().rho_scaling) {
-                            sg.ker_loc[2](ix, iy, k) -= att * scale * sg.sen_rho_loc(ix, iy, k, iper);
+                            sg.ker_loc[2](ix, iy, k) -= att * mg.rho3d_loc(ix, iy, k) * scale * sg.sen_rho_loc(ix, iy, k, iper);
                         }
                     }
                 }
@@ -278,7 +278,7 @@ void preproc::combine_kernels(SurfGrid& sg) {
             }
         } else if (sg.wave_type() == WaveType::RL) {
             // vs-only parametrisation: chain rule collapses vp and rho into the vs kernel
-            //   K_vs += adj_s * (sen_vs + sen_vp * d(vp)/d(vs) + sen_rho * d(rho)/d(vp) * d(vp)/d(vs))
+            //   K_vs += adj_s * vs * (sen_vs + sen_vp * d(vp)/d(vs) + sen_rho * d(rho)/d(vp) * d(vp)/d(vs))
             for (int ix = 0; ix < dcp.loc_nx(); ++ix) {
                 for (int iy = 0; iy < dcp.loc_ny(); ++iy) {
                     const int iglob_x = dcp.loc_I_start() + ix;
@@ -289,14 +289,14 @@ void preproc::combine_kernels(SurfGrid& sg) {
                         const real_t vp  = mg.vp3d_loc(ix, iy, k);
                         const real_t dab = dalpha_dbeta(vs);   // d(vp)/d(vs)
                         const real_t dra = drho_dalpha(vp);    // d(rho)/d(vp)
-                        sg.ker_loc[0](ix, iy, k) -= att * (
+                        sg.ker_loc[0](ix, iy, k) -= att * vs * (
                             sg.sen_vs_loc(ix, iy, k, iper)
                             + sg.sen_vp_loc(ix, iy, k, iper)  * dab
                             + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
                         );
 
                         if (IP.postproc().is_kden) {
-                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * (
+                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * vs * (
                                 sg.sen_vs_loc(ix, iy, k, iper)
                                 + sg.sen_vp_loc(ix, iy, k, iper)  * dab
                                 + sg.sen_rho_loc(ix, iy, k, iper) * dra * dab
@@ -313,9 +313,12 @@ void preproc::combine_kernels(SurfGrid& sg) {
                     const int iglob_y = dcp.loc_J_start() + iy;
                     const real_t att  = adj_tt(iglob_x, iglob_y);
                     for (int k = 0; k < ngrid_k; ++k) {
-                        sg.ker_loc[0](ix, iy, k) -= att * sg.sen_vs_loc(ix, iy, k, iper);
+                        // For Love waves in radial anisotropy, sen_vs is the sensitivity to vsh
+                        const real_t vs = IP.inversion().model_para_type == MODEL_RADIAL_ANI
+                            ? mg.vsh3d_loc(ix, iy, k) : mg.vs3d_loc(ix, iy, k);
+                        sg.ker_loc[0](ix, iy, k) -= att * vs * sg.sen_vs_loc(ix, iy, k, iper);
                         if (IP.postproc().is_kden) {
-                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * sg.sen_vs_loc(ix, iy, k, iper);
+                            sg.ker_den_loc(ix, iy, k) -= adj_den(iglob_x, iglob_y) * vs * sg.sen_vs_loc(ix, iy, k, iper);
                         }
                     }
                 }

@@ -66,10 +66,11 @@ real_t calc_descent_angle(const FieldVec &direction, const FieldVec &gradient) {
 // depth dimension already consists of discrete layer sensitivities.  This
 // routine therefore adds only the horizontal quadrature weight.
 //
-// The line-search derivative includes the model-update chain rule below:
-// for multiplicative parameters, -dm/dalpha = m*d; for additive gc/gs,
-// -dm/dalpha = d. The directional derivative therefore uses the physical
-// model values for vs/vp/rho and gamma before applying the horizontal weight.
+// No per-parameter chain rule from alpha to the physical model is needed:
+// combine_kernels() already returns dchi/dln(m) for the multiplicatively
+// updated parameters (vs/vp/rho/gamma) and dchi/dm for the additive ones
+// (gc/gs), so in both cases the step is x(alpha) = x0 - alpha*d and
+// -dx/dalpha = d.
 //
 // dlon_i and dlat_j are nodal quadrature widths.  End points receive half of
 // the adjacent interval, as in the trapezoidal rule.  No dz factor is added.
@@ -114,35 +115,13 @@ static real_t field_dot_global(const FieldVec &kernel,
                     * dlon * dlat;
 
                 for (int iz = 0; iz < ngrid_k; ++iz) {
-                    const int index = I2V(ix_global, iy_global, iz);
-                    real_t minus_dm_dalpha;
                     real_t kernel_val = kernel[p](ix, iy, iz);
-
-                    if (p == 0) {
-                        // vs(alpha) = vs0 * (1 - alpha*d_vs)
-                        minus_dm_dalpha =
-                            mg.vs3d[index] * direction[p](ix, iy, iz);
-                        if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
-                            kernel_val = kernel[0](ix, iy, iz) + kernel[5](ix, iy, iz);
-                        }
-                    } else if (p == 1) {
-                        // vp(alpha) = vp0 * (1 - alpha*d_vp)
-                        minus_dm_dalpha =
-                            mg.vp3d[index] * direction[p](ix, iy, iz);
-                    } else if (p == 2) {
-                        // rho(alpha) = rho0 * (1 - alpha*d_rho)
-                        minus_dm_dalpha =
-                            mg.rho3d[index] * direction[p](ix, iy, iz);
-                    } else if (p == 5 &&
-                               IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
-                        minus_dm_dalpha = (mg.vsh3d[index] / mg.vs3d[index]) * direction[p](ix, iy, iz);
-                    } else {
-                        // gc and gs are updated additively.
-                        minus_dm_dalpha = direction[p](ix, iy, iz);
+                    if (p == 0 && IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+                        // vsh = vs*gamma, so a vs step also moves vsh.
+                        kernel_val += kernel[5](ix, iy, iz);
                     }
 
-                    local += kernel_val
-                             * minus_dm_dalpha * area;
+                    local += kernel_val * direction[p](ix, iy, iz) * area;
                 }
             }
         }
@@ -172,8 +151,8 @@ WolfeResult wolfe_condition(const FieldVec &gradient, const FieldVec &ker_next,
     // so the actual descent step is d = -direction.  Wolfe conditions require
     // q = ∇f · d < 0, hence we negate the dot products here.
     // q is evaluated at the base model (alpha=0).  q1 is evaluated at the
-    // current trial point.  For the linear multiplicative updates their tangent
-    // is constant; path_alpha matters only for vsh = vs*gamma.
+    // current trial point, neglecting the O(alpha*d) difference between the
+    // linear update m0*(1 - alpha*d) and a step in ln(m).
     const real_t q  = -field_dot_global(gradient, direction);
     const real_t q1 = -field_dot_global(ker_next,  direction);
 
