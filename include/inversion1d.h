@@ -7,6 +7,8 @@
 #include <Eigen/Core>
 #include <Eigen/Dense>
 
+namespace surfker { struct DepthKernel1D; }
+
 class Inversion1D {
 public:
     explicit Inversion1D(WaveType wavetype);
@@ -26,4 +28,23 @@ private:
 
     int niter;
     std::vector<real_t> misfits;
+
+    // Validate depth grid, initial Vs and the active src_rec tables before
+    // the first forward call; logs every problem found and aborts if any.
+    void check_inputs(const Eigen::VectorX<real_t>& zarr) const;
+
+    // Abort with a diagnostic if disper() failed (returned 0 / non-finite).
+    void check_pred_vel(const Eigen::VectorX<real_t>& pred_vel,
+                        const Eigen::VectorX<real_t>& periods,
+                        const Eigen::VectorX<real_t>& zarr,
+                        int iter, WaveType wt, SurfType tp) const;
+
+    // Abort with a diagnostic if the depth kernels contain inf/NaN.
+    void check_kernels(const surfker::DepthKernel1D& kernels,
+                       const Eigen::VectorX<real_t>& periods,
+                       const Eigen::VectorX<real_t>& zarr,
+                       int iter, WaveType wt, SurfType tp) const;
+
+    // Log the current Vs profile and its first non-physical node, if any.
+    void log_vs_profile(const Eigen::VectorX<real_t>& zarr, int n_update) const;
 };

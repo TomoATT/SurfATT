@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "config.h"
 
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -17,11 +18,12 @@
 //   - Only rank 0 performs file I/O (single reader, deterministic parsing).
 //   - Other ranks obtain the same data via broadcast + shared-memory sync,
 //     avoiding duplicated memory footprint per rank.
-void SrcRec::load(const std::string& filepath)
+void SrcRec::load(const std::string& filepath, bool check_obs)
 {
     auto& mpi = Parallel::mpi();
     // auto& IP = InputParams::IP();
     auto& logger = ATTLogger::logger();
+    filepath_ = filepath;
 
     std::vector<real_t> v_stla, v_stlo, v_evla, v_evlo, v_dist,
                         v_period, v_tt, v_vel, v_weight;
@@ -121,11 +123,46 @@ void SrcRec::load(const std::string& filepath)
     mpi.sync_from_main_rank(vel, n_obs_);
     mpi.sync_from_main_rank(weight, n_obs_);
 
+    // Validate before get_periods(): its std::sort needs NaN-free periods.
+    // tt/vel are only checked when they are observations; forward runs may
+    // carry placeholders there. Every rank sees the same shared data, so all
+    // reach the same verdict; the barrier lets rank 0 flush its log first.
+    int n_bad_cols = (check_positive(period_all, "period") > 0);
+    if (check_obs) {
+        n_bad_cols += (check_positive(tt, "tt") > 0);
+        n_bad_cols += (check_positive(vel, "vel") > 0);
+    }
+    if (n_bad_cols > 0) {
+        logger.Error(fmt::format("SrcRec::load: {} column(s) of {} contain invalid values; see messages above.",
+            n_bad_cols, filepath), MODULE_SRCREC);
+        mpi.barrier();
+        mpi.abort(EXIT_FAILURE);
+    }
+
     // Build derived metadata used by inversion/forward steps:
     //   - event-wise receiver index lists
     //   - per-period statistics (counts and mean velocities)
     get_periods();
     get_events();
+}
+
+// Rows are reported as CSV line numbers: data row index + 2 (header is line 1).
+int SrcRec::check_positive(const real_t* col, const std::string& col_name) const {
+    constexpr int MAX_BAD_ROWS_SHOWN = 10;
+    std::vector<int> rows;
+    for (int i = 0; i < n_obs_; ++i) {
+        if (!std::isfinite(col[i]) || col[i] <= _0_CR) rows.push_back(i);
+    }
+    if (rows.empty()) return 0;
+
+    std::string msg = fmt::format("{}: '{}' must be finite and > 0; {} row(s):",
+        filepath_, col_name, rows.size());
+    for (size_t i = 0; i < rows.size() && i < MAX_BAD_ROWS_SHOWN; ++i) {
+        msg += fmt::format(" line {} ({})", rows[i] + 2, col[rows[i]]);
+    }
+    if (rows.size() > MAX_BAD_ROWS_SHOWN) msg += " ...";
+    ATTLogger::logger().Error(msg, MODULE_SRCREC);
+    return static_cast<int>(rows.size());
 }
 
 // Build an event -> observation-index mapping from evtname and distribute
