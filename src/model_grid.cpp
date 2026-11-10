@@ -401,9 +401,16 @@ void ModelGrid::load_3d_model() {
             }
         };
 
-        // --- vs or vsv (required) ---
+        // --- vs or vsv (required; radial anisotropy falls back to 'vs' if 'vsv' is absent) ---
         {
-            std::string key = IP.inversion().model_para_type == MODEL_RADIAL_ANI ? "vsv" : "vs";
+            std::string key = "vs";
+            if (IP.inversion().model_para_type == MODEL_RADIAL_ANI) {
+                if (f.exists("vsv")) {
+                    key = "vsv";
+                } else {
+                    logger.Info("'vsv' not found in HDF5 file, using 'vs' as vsv.", MODULE_GRID);
+                }
+            }
             interpolate_or_copy(key, vs3d);
             logger.Info(
                 same_grid ? "Loaded '" + key + "' from HDF5 file." :
@@ -494,6 +501,13 @@ void ModelGrid::load_3d_model() {
         logger.Error(fmt::format(
             "ModelGrid: failed to load 3D model from HDF5 file '{}': {}",
             IP.model().init_model_path, e.what()
+        ), MODULE_GRID);
+        mpi.abort(EXIT_FAILURE);
+    } catch (const H5::Exception &e) {
+        // H5::Exception does not derive from std::exception
+        logger.Error(fmt::format(
+            "ModelGrid: failed to load 3D model from HDF5 file '{}': {}",
+            IP.model().init_model_path, e.getDetailMsg()
         ), MODULE_GRID);
         mpi.abort(EXIT_FAILURE);
     }

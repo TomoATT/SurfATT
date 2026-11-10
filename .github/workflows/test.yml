@@ -65,6 +65,12 @@ jobs:
         shell: bash -l {0}
         env:
           NPROC: 2
+          # Some Azure runners expose a MANA RDMA device (mana_0) that UCX
+          # cannot open, which aborts MPI at startup. Tests run on a single
+          # node, so bypass UCX and use the shared-memory/TCP transports.
+          OMPI_MCA_pml: ob1
+          OMPI_MCA_btl: self,sm,tcp
+          OMPI_MCA_osc: ^ucx
         run: |
           SURFATT_BIN=$(realpath bin)
           cd ../SurfATT-tests/${{ matrix.testcase }}
